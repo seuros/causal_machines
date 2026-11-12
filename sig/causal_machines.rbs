@@ -1,0 +1,47 @@
+module CausalMachines
+  VERSION: String
+  MEMBERS: Integer
+  CAPACITY: Integer
+
+  type clock = Array[Integer]
+  type refusal = :unknown_member | :stale_generation | :future_generation | :malformed | :exhausted
+
+  class Stamp < Data
+    attr_reader generation: Integer
+    attr_reader sender: Integer
+    attr_reader clock: clock
+    def self.new: (Integer generation, Integer sender, clock clock) -> Stamp
+                | (generation: Integer, sender: Integer, clock: clock) -> Stamp
+  end
+
+  class Gap < Data
+    attr_reader replica: Integer
+    attr_reader from: Integer
+    attr_reader through: Integer
+    def self.new: (Integer replica, Integer from, Integer through) -> Gap
+                | (replica: Integer, from: Integer, through: Integer) -> Gap
+  end
+
+  def self.compare: (clock left, clock right) -> (:equal | :before | :after | :concurrent)
+  def self.dominates?: (clock left, clock right) -> bool
+  def self.concurrent?: (clock left, clock right) -> bool
+  def self.merge: (clock left, clock right) -> clock
+
+  class Tracker
+    def self.new: (Array[Integer] members, Integer local, Integer generation) -> Tracker
+    def self.restore: (Array[Integer] members, Integer local, Integer generation, clock delivered) -> Tracker
+    def stamp: () -> (Stamp | :exhausted)
+    def check: (Stamp stamp) -> (:deliverable | :duplicate | :missing | refusal)
+    def receive: (Stamp stamp) -> (:delivered | :held | :already_held | :duplicate | :conflict | :full | refusal)
+    def release: () -> ([:deliver | :obsolete, Stamp] | nil)
+    def forget: (Integer sender, Integer counter) -> bool
+    def missing: (Stamp stamp, Integer cursor, Integer limit) -> ([Array[Gap], Integer?] | refusal)
+    def absorb: (Integer generation, clock clock) -> (true | refusal)
+    def clock: () -> clock
+    def held: () -> Integer
+    def members: () -> Array[Integer]
+    def local: () -> Integer
+    def generation: () -> Integer
+    def capacity: () -> Integer
+  end
+end
