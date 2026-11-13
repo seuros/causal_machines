@@ -19,7 +19,9 @@ sender had delivered is delivered here; `Duplicate` when the delivered clock
 already covers it; otherwise `Missing`. `receive` delivers or parks, `release`
 hands back parked stamps one at a time as their dependencies arrive, and
 `missing` lists the undelivered runs per replica into a caller buffer, resumable
-by cursor.
+by cursor. It writes the first `Page::written` entries of `out` and leaves the
+rest untouched; build the buffer as `[Gap::default(); K]`. The default is a
+placeholder the core never emits, because counters start at 1.
 
 Refusals are explicit and leave state untouched: a full hold table answers
 `Full`, a stamp from another membership generation answers `StaleGeneration` or
@@ -46,7 +48,7 @@ let answer = bob.stamp().expect("counter has room");
 
 // The answer overtakes the question on the way to Carol.
 assert_eq!(carol.receive(&answer), Ok(Receipt::Held));
-let mut gaps = [Gap { replica: 0, from: 0, through: 0 }; 3];
+let mut gaps = [Gap::default(); 3];
 let page = carol.missing(&answer, 0, &mut gaps).expect("well formed");
 assert_eq!((page.written, page.next), (1, None));
 assert_eq!(gaps[0], Gap { replica: 1, from: 1, through: 1 });

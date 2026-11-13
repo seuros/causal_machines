@@ -142,12 +142,7 @@ impl Tracker {
                 format!("limit is at most {MEMBERS}"),
             ));
         }
-        let blank = Gap {
-            replica: 0,
-            from: 0,
-            through: 0,
-        };
-        let mut gaps = [blank; MEMBERS];
+        let mut gaps = [Gap::default(); MEMBERS];
         let cursor = usize::try_from(cursor.0).unwrap_or(usize::MAX);
         let out = gaps.get_mut(..limit).unwrap_or(&mut []);
         let page = match this.core.borrow().missing(&stamp, cursor, out) {

@@ -333,3 +333,19 @@ fn counters_at_the_u64_limit_neither_wrap_nor_reissue() {
     assert_eq!(c.clock().get(0), Some(u64::MAX));
     assert_eq!(c.receive(&last), Ok(Receipt::Duplicate));
 }
+
+#[test]
+fn a_default_buffer_is_filled_from_the_front() {
+    let c = node(C);
+    let mut out = [Gap::default(); 4];
+    assert_eq!(out[0].from, 0);
+    let page = c.missing(&stamp(B, [1, 2, 0, 0]), 0, &mut out);
+    assert_eq!(page.map(|p| (p.written, p.next)), Ok((2, None)));
+    let listed = [(A, 1, 1), (B, 1, 1)].map(|(replica, from, through)| Gap {
+        replica,
+        from,
+        through,
+    });
+    assert_eq!(out[..2], listed);
+    assert_eq!(out[2..], [Gap::default(); 2]);
+}

@@ -69,7 +69,10 @@ pub enum Release<const N: usize> {
 }
 
 /// A run of undelivered messages from one replica, inclusive at both ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Gap::default()` is a placeholder for pre-filling an output buffer: its
+/// `from` is 0, and counters start at 1, so [`Causal::missing`] never emits it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gap {
     /// Replica whose messages are missing.
     pub replica: ReplicaId,
@@ -257,6 +260,9 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// Start with `cursor` 0 and pass each page's `next` back until it is
     /// `None`. Gaps are measured against the delivered clock; a parked stamp
     /// does not close one. A deliverable or duplicate stamp lists nothing.
+    ///
+    /// The first [`Page::written`] entries of `out` are written; the rest are
+    /// left untouched. Build the buffer as `[Gap::default(); K]`.
     ///
     /// # Errors
     ///
