@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/seuros/causal_machines/compare/causal_machines/v0.1.1...causal_machines/v0.1.2) (2026-11-13)
+
+
+### Features
+
+* implement Default for Gap ([5aa1b2c](https://github.com/seuros/causal_machines/commit/5aa1b2c5029d9d45da2f1f8ca3fdfd19a659b8f7))
+
 ## [0.1.1](https://github.com/seuros/causal_machines/compare/causal_machines-v0.1.0...causal_machines/v0.1.1) (2026-11-12)
 
 
