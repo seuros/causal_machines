@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.1.2...causal_machines/v0.2.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* see CONVENTIONS: one exhaustive Refusal per crate, Result from every mutator, honoured idempotent repeats, Ruby mirrors the core. No compatibility aliases. check and missing can answer Conflict; the Ruby class is Causal; release answers Deliver or Obsolete values.
+
+### Features
+
+* check conflicts on every receive path, Conflict and Full are refusals, forget answers Forgetting ([b2867a8](https://github.com/seuros/causal_machines/commit/b2867a83677cdc2180e9b771ce36eb4ed78624a9))
+
 ## [0.1.2](https://github.com/seuros/causal_machines/compare/causal_machines/v0.1.1...causal_machines/v0.1.2) (2026-11-13)
 
 
