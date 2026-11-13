@@ -4,7 +4,11 @@ module CausalMachines
   CAPACITY: Integer
 
   type clock = Array[Integer]
-  type refusal = :unknown_member | :stale_generation | :future_generation | :malformed | :exhausted
+
+  # Why a stamp is not acceptable here at all. A refused call changed nothing.
+  # Every refusal is the snake_case of one core `Refusal` variant; there is no
+  # catch-all symbol.
+  type unfit = :stale_generation | :future_generation | :unknown_member | :malformed
 
   class Stamp < Data
     attr_reader generation: Integer
@@ -12,6 +16,20 @@ module CausalMachines
     attr_reader clock: clock
     def self.new: (Integer generation, Integer sender, clock clock) -> Stamp
                 | (generation: Integer, sender: Integer, clock: clock) -> Stamp
+  end
+
+  # The core's `Release::Deliver(stamp)`: now delivered, apply its payload.
+  class Deliver < Data
+    attr_reader stamp: Stamp
+    def self.new: (Stamp stamp) -> Deliver
+                | (stamp: Stamp) -> Deliver
+  end
+
+  # The core's `Release::Obsolete(stamp)`: already covered, drop its payload.
+  class Obsolete < Data
+    attr_reader stamp: Stamp
+    def self.new: (Stamp stamp) -> Obsolete
+                | (stamp: Stamp) -> Obsolete
   end
 
   class Gap < Data
@@ -22,24 +40,56 @@ module CausalMachines
                 | (replica: Integer, from: Integer, through: Integer) -> Gap
   end
 
+  class Page < Data
+    attr_reader gaps: Array[Gap]
+    attr_reader next: Integer?
+    def self.new: (Array[Gap] gaps, Integer? next) -> Page
+                | (gaps: Array[Gap], next: Integer?) -> Page
+  end
+
   def self.compare: (clock left, clock right) -> (:equal | :before | :after | :concurrent)
   def self.dominates?: (clock left, clock right) -> bool
   def self.concurrent?: (clock left, clock right) -> bool
   def self.merge: (clock left, clock right) -> clock
 
-  class Tracker
-    def self.new: (Array[Integer] members, Integer local, Integer generation) -> Tracker
-    def self.restore: (Array[Integer] members, Integer local, Integer generation, clock delivered) -> Tracker
+  class Causal
+    def self.new: (Array[Integer] members, Integer local, Integer generation) -> Causal
+    def self.restore: (Array[Integer] members, Integer local, Integer generation, clock delivered) -> Causal
+
+    # Honoured: a Stamp. Refusal: :exhausted.
     def stamp: () -> (Stamp | :exhausted)
-    def check: (Stamp stamp) -> (:deliverable | :duplicate | :missing | refusal)
-    def receive: (Stamp stamp) -> (:delivered | :held | :already_held | :duplicate | :conflict | :full | refusal)
-    def release: () -> ([:deliver | :obsolete, Stamp] | nil)
-    def forget: (Integer sender, Integer counter) -> bool
-    def missing: (Stamp stamp, Integer cursor, Integer limit) -> ([Array[Gap], Integer?] | refusal)
-    def absorb: (Integer generation, clock clock) -> (true | refusal)
+
+    # Answers: :deliverable, :duplicate, :missing. Refusals: the unfit symbols,
+    # and :conflict when a different stamp with the same sender and counter
+    # is held, whichever of the three the stamp would otherwise be.
+    def check: (Stamp stamp) -> (:deliverable | :duplicate | :missing | :conflict | unfit)
+
+    # Honoured: :delivered, :held, and the repeats :already_held and :duplicate.
+    # Refusals: the unfit symbols, :conflict as for check (a held stamp is
+    # never dropped or replaced for a different one), and :full when the
+    # stamp must wait and no hold slot is free.
+    def receive: (Stamp stamp) -> (:delivered | :held | :already_held | :duplicate | :conflict | :full | unfit)
+
+    # nil when nothing is ready. Never refuses.
+    def release: () -> (Deliver | Obsolete | nil)
+
+    # Honoured: :forgotten when a held stamp was dropped, and the repeat
+    # :not_held when none was held. Refusal: :unknown_member. The only call
+    # that discards a held stamp without handing it back.
+    def forget: (Integer sender, Integer counter) -> (:forgotten | :not_held | :unknown_member)
+
+    # Honoured: a Page. Refusals: the unfit symbols, and :conflict as for
+    # check.
+    def missing: (Stamp stamp, Integer cursor, Integer limit) -> (Page | :conflict | unfit)
+
+    # Honoured: :absorbed. Refusals: :stale_generation, :future_generation.
+    # (The core's `Malformed` cannot be reached here: a clock of the wrong
+    # length raises RangeError before the core sees it.)
+    def absorb: (Integer generation, clock clock) -> (:absorbed | :stale_generation | :future_generation)
+
     def clock: () -> clock
     def held: () -> Integer
-    def members: () -> Array[Integer]
+    def membership: () -> Array[Integer]
     def local: () -> Integer
     def generation: () -> Integer
     def capacity: () -> Integer

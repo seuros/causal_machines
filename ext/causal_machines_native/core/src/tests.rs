@@ -1,5 +1,6 @@
 extern crate std;
 
+mod conflict;
 mod model;
 
 use super::*;
@@ -166,14 +167,23 @@ fn a_full_hold_table_refuses_without_mutating() {
     assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::Held));
     assert_eq!(c.receive(&stamp(A, [3, 0, 0, 0])), Ok(Receipt::Held));
     let before = c.clone();
-    assert_eq!(c.receive(&stamp(A, [4, 0, 0, 0])), Ok(Receipt::Full));
+    assert_eq!(c.receive(&stamp(A, [4, 0, 0, 0])), Err(Refusal::Full));
     assert_eq!(c, before);
-    assert_eq!(c.receive(&stamp(A, [2, 1, 0, 0])), Ok(Receipt::Conflict));
+    assert_eq!(c.receive(&stamp(A, [2, 1, 0, 0])), Err(Refusal::Conflict));
+    assert_eq!(c, before);
+    // Idempotent repeats are honoured and change nothing either.
+    assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::AlreadyHeld));
+    assert_eq!(c, before);
+    assert_eq!(c.forget(99, 3), Err(Refusal::UnknownMember));
+    assert_eq!(c.forget(B, 3), Ok(Forgetting::NotHeld));
+    assert_eq!(c.forget(A, 9), Ok(Forgetting::NotHeld));
     assert_eq!(c, before);
 
-    assert!(c.forget(A, 3));
-    assert!(!c.forget(A, 3));
-    assert!(!c.forget(99, 3));
+    assert_eq!(c.forget(A, 3), Ok(Forgetting::Forgotten));
+    assert_eq!(c.held(), 1);
+    let forgotten = c.clone();
+    assert_eq!(c.forget(A, 3), Ok(Forgetting::NotHeld));
+    assert_eq!(c, forgotten);
     assert_eq!(c.receive(&stamp(A, [4, 0, 0, 0])), Ok(Receipt::Held));
     assert_eq!(c.receive(&stamp(A, [1, 0, 0, 0])), Ok(Receipt::Delivered));
     assert_eq!(c.release(), Some(Release::Deliver(stamp(A, [2, 0, 0, 0]))));
@@ -183,7 +193,7 @@ fn a_full_hold_table_refuses_without_mutating() {
     let Some(mut strict) = Causal::<4, 0>::new(members(), C, 7) else {
         panic!("local replica is a member");
     };
-    assert_eq!(strict.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::Full));
+    assert_eq!(strict.receive(&stamp(A, [2, 0, 0, 0])), Err(Refusal::Full));
     assert_eq!(
         strict.receive(&stamp(A, [1, 0, 0, 0])),
         Ok(Receipt::Delivered)
@@ -224,6 +234,11 @@ fn stale_future_unknown_and_malformed_stamps_are_refused_untouched() {
     assert_eq!(c.absorb(7, &outside), Err(Refusal::Malformed));
     assert_eq!(c, before);
     assert_eq!(std::format!("{}", Refusal::Malformed), "malformed clock");
+    assert_eq!(std::format!("{}", Refusal::Full), "hold table full");
+    assert_ne!(
+        std::format!("{}", Refusal::Conflict),
+        std::format!("{}", Refusal::Full)
+    );
 }
 
 #[test]

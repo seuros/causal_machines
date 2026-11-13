@@ -11,7 +11,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("dominates?", function!(vectors::dominates, 2))?;
     module.define_singleton_method("concurrent?", function!(vectors::concurrent, 2))?;
     module.define_singleton_method("merge", function!(vectors::merge, 2))?;
-    let class = module.define_class("Tracker", ruby.class_object())?;
+    let class = module.define_class("Causal", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Tracker::new, 3))?;
     class.define_singleton_method("restore", function!(Tracker::restore, 4))?;
@@ -24,7 +24,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("absorb", method!(Tracker::absorb, 2))?;
     class.define_method("clock", method!(Tracker::clock, 0))?;
     class.define_method("held", method!(Tracker::held, 0))?;
-    class.define_method("members", method!(Tracker::members, 0))?;
+    class.define_method("membership", method!(Tracker::membership, 0))?;
     class.define_method("local", method!(Tracker::local, 0))?;
     class.define_method("generation", method!(Tracker::generation, 0))?;
     class.define_method("capacity", function!(Tracker::capacity, 0))?;

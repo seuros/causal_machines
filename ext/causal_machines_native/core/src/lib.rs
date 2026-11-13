@@ -4,15 +4,14 @@
 mod tracker;
 mod vector;
 
-pub use tracker::{Causal, Gap, Page, Readiness, Receipt, Release, Stamp};
+pub use tracker::{Causal, Forgetting, Gap, Page, Readiness, Receipt, Release, Stamp};
 pub use vector::{Causality, Membership, VersionVector};
 
 /// Which replica an event came from.
 pub type ReplicaId = u64;
 
-/// Why a call was refused. A refused call leaves every state untouched.
+/// Why a call was not honoured. A refused call leaves every state untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Refusal {
     /// The replica or slot is not part of the fixed membership.
     UnknownMember,
@@ -25,6 +24,12 @@ pub enum Refusal {
     Malformed,
     /// The counter is at `u64::MAX`; no further event can be numbered.
     Exhausted,
+    /// A parked stamp from the same sender with the same counter carries a
+    /// different clock. Answered whatever the readiness of either stamp:
+    /// deliverable, missing dependencies or already covered.
+    Conflict,
+    /// Dependencies are missing and every hold slot is taken.
+    Full,
 }
 
 impl core::fmt::Display for Refusal {
@@ -35,6 +40,8 @@ impl core::fmt::Display for Refusal {
             Self::FutureGeneration => "future membership generation",
             Self::Malformed => "malformed clock",
             Self::Exhausted => "counter exhausted",
+            Self::Conflict => "conflicting stamp already held",
+            Self::Full => "hold table full",
         })
     }
 }

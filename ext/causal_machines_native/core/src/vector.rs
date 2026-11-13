@@ -162,7 +162,10 @@ impl<const N: usize> VersionVector<N> {
     /// Whether this vector has seen everything `other` has (equal counts).
     #[must_use]
     pub fn dominates(&self, other: &Self) -> bool {
-        matches!(self.compare(other), Causality::Equal | Causality::After)
+        match self.compare(other) {
+            Causality::Equal | Causality::After => true,
+            Causality::Before | Causality::Concurrent => false,
+        }
     }
 
     /// Whether each vector has seen an event the other has not.

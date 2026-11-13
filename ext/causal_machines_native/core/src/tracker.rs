@@ -40,23 +40,27 @@ pub enum Readiness {
     Missing,
 }
 
-/// What [`Causal::receive`] did with a stamp.
+/// What an honoured [`Causal::receive`] did with a stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Receipt {
     /// Delivered: the delivered clock advanced.
     Delivered,
     /// Dependencies are missing; the stamp is parked until they arrive.
     Held,
-    /// The same stamp is already parked.
+    /// An idempotent repeat: the same stamp is already parked. Nothing
+    /// changed.
     AlreadyHeld,
-    /// Already delivered; nothing changed.
+    /// An idempotent repeat: already delivered. Nothing changed.
     Duplicate,
-    /// A parked stamp from the same sender with the same counter carries a
-    /// different clock.
-    Conflict,
-    /// Dependencies are missing and every hold slot is taken; nothing changed.
-    Full,
+}
+
+/// What an honoured [`Causal::forget`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgetting {
+    /// The parked stamp was dropped; its hold slot is free.
+    Forgotten,
+    /// No such stamp was parked: an idempotent repeat that changed nothing.
+    NotHeld,
 }
 
 /// A parked stamp leaving the hold table.
@@ -195,34 +199,53 @@ impl<const N: usize, const P: usize> Causal<N, P> {
 
     /// Whether `stamp` could be delivered now. Changes nothing.
     ///
+    /// It answers what [`Causal::receive`] would do with the stamp, short of
+    /// the hold table being full.
+    ///
     /// # Errors
     ///
-    /// Any [`Refusal`] but `Exhausted`: wrong generation, unknown sender, or
-    /// a malformed clock.
+    /// In this order: [`Refusal::StaleGeneration`] or
+    /// [`Refusal::FutureGeneration`], [`Refusal::UnknownMember`] for the
+    /// sender, [`Refusal::Malformed`], and [`Refusal::Conflict`] when a
+    /// different stamp with the same sender and counter is parked, whatever
+    /// the readiness of either.
     pub fn check(&self, stamp: &Stamp<N>) -> Result<Readiness, Refusal> {
         self.classify(stamp).map(|(_, _, readiness)| readiness)
     }
 
     /// Delivers `stamp` if it is ready, parks it if it is not.
     ///
-    /// A message with the same sender and counter as a delivered one is
-    /// dropped from the hold table when it is delivered here.
+    /// A stamp that is already delivered or already parked is honoured again
+    /// and changes nothing. When the very stamp being delivered is also
+    /// parked, because its dependencies arrived and it was received again
+    /// before [`Causal::release`] was called, the parked copy leaves the hold
+    /// table with it: it is the same message, delivered once.
+    ///
+    /// A parked stamp is never dropped or replaced for a different one. A
+    /// stamp whose sender and counter match a parked stamp but whose clock
+    /// does not is refused whether it would have been delivered, parked or
+    /// called a duplicate: the two cannot both be the sender's message, and
+    /// the tracker cannot tell which is. [`Causal::forget`] the parked one to
+    /// take the other.
     ///
     /// # Errors
     ///
-    /// As [`Causal::check`]. A refused stamp changes nothing.
+    /// As [`Causal::check`], [`Refusal::Conflict`] included, plus
+    /// [`Refusal::Full`] when the stamp must wait and no hold slot is free.
+    /// A refused stamp changes nothing.
     pub fn receive(&mut self, stamp: &Stamp<N>) -> Result<Receipt, Refusal> {
         let (slot, counter, readiness) = self.classify(stamp)?;
         match readiness {
             Readiness::Duplicate => Ok(Receipt::Duplicate),
             Readiness::Deliverable => {
+                // `classify` refused any other stamp: this is the same one.
                 if let Some(index) = self.find(slot, counter) {
                     self.vacate(index);
                 }
                 self.delivered.set(slot, counter);
                 Ok(Receipt::Delivered)
             }
-            Readiness::Missing => Ok(self.park(slot, counter, stamp)),
+            Readiness::Missing => self.park(slot, counter, stamp),
         }
     }
 
@@ -231,7 +254,8 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// Stamps the delivered clock already covers come out first as
     /// [`Release::Obsolete`], lowest slot then lowest counter. Then ready
     /// stamps come out as [`Release::Deliver`], lowest slot first, each
-    /// advancing the delivered clock. Call until `None`.
+    /// advancing the delivered clock. Call until `None`, which is a drain's
+    /// "nothing is ready" and not a refusal; it changes nothing.
     pub fn release(&mut self) -> Option<Release<N>> {
         if let Some(index) = self.pick(Self::covered) {
             return self
@@ -246,13 +270,22 @@ impl<const N: usize, const P: usize> Causal<N, P> {
 
     /// Drops the parked stamp numbered `counter` from `sender`.
     ///
-    /// Returns whether one was parked.
-    pub fn forget(&mut self, sender: ReplicaId, counter: u64) -> bool {
-        self.members
-            .slot(sender)
-            .and_then(|slot| self.find(slot, counter))
-            .and_then(|index| self.vacate(index))
-            .is_some()
+    /// This is the only call that discards a parked stamp without handing it
+    /// back, and it does so by name: it is how a caller resolves a
+    /// [`Refusal::Conflict`] in favour of the stamp that was refused.
+    ///
+    /// [`Forgetting::NotHeld`] is an idempotent repeat: no such stamp is
+    /// parked, which is what the caller asked for, so nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::UnknownMember`] when `sender` is not in the membership.
+    pub fn forget(&mut self, sender: ReplicaId, counter: u64) -> Result<Forgetting, Refusal> {
+        let slot = self.members.slot(sender).ok_or(Refusal::UnknownMember)?;
+        let dropped = self
+            .find(slot, counter)
+            .and_then(|index| self.vacate(index));
+        Ok(dropped.map_or(Forgetting::NotHeld, |_| Forgetting::Forgotten))
     }
 
     /// Lists what must be delivered before `stamp`, one bounded page a call.
@@ -266,7 +299,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     ///
     /// # Errors
     ///
-    /// As [`Causal::check`].
+    /// As [`Causal::check`], [`Refusal::Conflict`] included.
     pub fn missing(
         &self,
         stamp: &Stamp<N>,
@@ -341,6 +374,9 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         if counter == 0 {
             return Err(Refusal::Malformed);
         }
+        if self.conflicts(slot, counter, stamp) {
+            return Err(Refusal::Conflict);
+        }
         let readiness = if counter <= self.seen(slot) {
             Readiness::Duplicate
         } else if self.blocked(slot, &stamp.clock) {
@@ -380,6 +416,14 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         !self.blocked(parked.slot, &parked.stamp.clock)
     }
 
+    /// Whether a parked stamp numbers the same message as `stamp` but is not
+    /// `stamp`. At most one stamp is parked per sender and counter.
+    fn conflicts(&self, slot: usize, counter: u64, stamp: &Stamp<N>) -> bool {
+        self.parked.iter().flatten().any(|parked| {
+            parked.slot == slot && parked.counter == counter && parked.stamp != *stamp
+        })
+    }
+
     fn find(&self, slot: usize, counter: u64) -> Option<usize> {
         self.parked.iter().position(|entry| {
             entry.is_some_and(|parked| parked.slot == slot && parked.counter == counter)
@@ -398,27 +442,22 @@ impl<const N: usize, const P: usize> Causal<N, P> {
             .map(|(index, _)| index)
     }
 
-    fn park(&mut self, slot: usize, counter: u64, stamp: &Stamp<N>) -> Receipt {
-        if let Some(index) = self.find(slot, counter) {
-            let same = self
-                .parked
-                .get(index)
-                .is_some_and(|entry| entry.is_some_and(|parked| parked.stamp == *stamp));
-            return if same {
-                Receipt::AlreadyHeld
-            } else {
-                Receipt::Conflict
-            };
+    fn park(&mut self, slot: usize, counter: u64, stamp: &Stamp<N>) -> Result<Receipt, Refusal> {
+        // `classify` refused any other stamp: a parked one is this one.
+        if self.find(slot, counter).is_some() {
+            return Ok(Receipt::AlreadyHeld);
         }
-        let Some(free) = self.parked.iter_mut().find(|entry| entry.is_none()) else {
-            return Receipt::Full;
-        };
+        let free = self
+            .parked
+            .iter_mut()
+            .find(|entry| entry.is_none())
+            .ok_or(Refusal::Full)?;
         *free = Some(Parked {
             slot,
             counter,
             stamp: *stamp,
         });
-        Receipt::Held
+        Ok(Receipt::Held)
     }
 
     fn vacate(&mut self, index: usize) -> Option<Parked<N>> {

@@ -9,7 +9,10 @@ extern crate std;
 use std::collections::BTreeSet;
 use std::vec::Vec;
 
-use crate::{Causal, Gap, Membership, Readiness, Receipt, Release, ReplicaId, Stamp};
+use crate::{
+    Causal, Forgetting, Gap, Membership, Readiness, Receipt, Refusal, Release, ReplicaId, Stamp,
+    VersionVector,
+};
 
 const SLOTS: usize = 5;
 const REPLICAS: usize = 4;
@@ -75,7 +78,21 @@ impl Naive {
         lacking
     }
 
-    fn check(&self, stamp: &Message) -> Readiness {
+    /// A held message numbered like `stamp` that is not `stamp`.
+    fn conflict(&self, stamp: &Message) -> bool {
+        let mut same = self.held.iter().filter(|h| identity(h) == identity(stamp));
+        same.any(|held| held != stamp)
+    }
+
+    fn check(&self, stamp: &Message) -> Result<Readiness, Refusal> {
+        if self.conflict(stamp) {
+            Err(Refusal::Conflict)
+        } else {
+            Ok(self.readiness(stamp))
+        }
+    }
+
+    fn readiness(&self, stamp: &Message) -> Readiness {
         if self.delivered.contains(&identity(stamp)) {
             Readiness::Duplicate
         } else if self.lacking(stamp).is_empty() {
@@ -85,26 +102,23 @@ impl Naive {
         }
     }
 
-    fn receive(&mut self, stamp: &Message) -> Receipt {
-        match self.check(stamp) {
-            Readiness::Duplicate => Receipt::Duplicate,
+    fn receive(&mut self, stamp: &Message) -> Result<Receipt, Refusal> {
+        match self.check(stamp)? {
+            Readiness::Duplicate => Ok(Receipt::Duplicate),
             Readiness::Deliverable => {
-                self.held.retain(|held| identity(held) != identity(stamp));
+                // Only the message itself is left to drop from the hold.
+                self.held.retain(|held| held != stamp);
                 self.delivered.insert(identity(stamp));
-                Receipt::Delivered
+                Ok(Receipt::Delivered)
             }
             Readiness::Missing => {
-                if let Some(held) = self.held.iter().find(|h| identity(h) == identity(stamp)) {
-                    if held == stamp {
-                        Receipt::AlreadyHeld
-                    } else {
-                        Receipt::Conflict
-                    }
+                if self.held.contains(stamp) {
+                    Ok(Receipt::AlreadyHeld)
                 } else if self.held.len() == HOLD {
-                    Receipt::Full
+                    Err(Refusal::Full)
                 } else {
                     self.held.push(*stamp);
-                    Receipt::Held
+                    Ok(Receipt::Held)
                 }
             }
         }
@@ -114,7 +128,7 @@ impl Naive {
         let chosen = self
             .held
             .iter()
-            .filter(|held| self.check(held) == wanted)
+            .filter(|held| self.readiness(held) == wanted)
             .map(identity)
             .min()?;
         let index = self.held.iter().position(|h| identity(h) == chosen)?;
@@ -146,7 +160,7 @@ impl Naive {
 
     fn gaps(&self, stamp: &Message) -> Vec<Gap> {
         let lacking = self.lacking(stamp);
-        if self.check(stamp) != Readiness::Missing {
+        if self.readiness(stamp) != Readiness::Missing {
             return Vec::new();
         }
         let mut gaps = Vec::new();
@@ -178,6 +192,9 @@ struct World {
     trackers: Vec<Tracker>,
     models: Vec<Naive>,
     log: Vec<Message>,
+    /// Conflicts refused, by what the stamp would otherwise have been:
+    /// deliverable, missing, duplicate.
+    conflicts: [usize; 3],
 }
 
 impl World {
@@ -199,6 +216,7 @@ impl World {
             trackers,
             models,
             log: Vec::new(),
+            conflicts: [0; 3],
         }
     }
 
@@ -206,22 +224,31 @@ impl World {
         let Ok(stamp) = self.trackers[replica].stamp() else {
             panic!("small counters never exhaust");
         };
-        assert_eq!(self.models[replica].check(&stamp), Readiness::Deliverable);
+        assert_eq!(
+            self.models[replica].check(&stamp),
+            Ok(Readiness::Deliverable)
+        );
         self.models[replica].delivered.insert(identity(&stamp));
         self.log.push(stamp);
     }
 
     fn receive(&mut self, replica: usize, stamp: &Message) {
         let expected = self.models[replica].check(stamp);
-        assert_eq!(self.trackers[replica].check(stamp), Ok(expected));
+        assert_eq!(self.trackers[replica].check(stamp), expected);
+        if expected == Err(Refusal::Conflict) {
+            let kind = match self.models[replica].readiness(stamp) {
+                Readiness::Deliverable => 0,
+                Readiness::Missing => 1,
+                Readiness::Duplicate => 2,
+            };
+            self.conflicts[kind] += 1;
+        }
         self.listing(replica, stamp);
         let before = self.trackers[replica].clone();
         let receipt = self.models[replica].receive(stamp);
-        assert_eq!(self.trackers[replica].receive(stamp), Ok(receipt));
-        if matches!(
-            receipt,
-            Receipt::Duplicate | Receipt::Full | Receipt::AlreadyHeld | Receipt::Conflict
-        ) {
+        assert_eq!(self.trackers[replica].receive(stamp), receipt);
+        // A refusal or an idempotent repeat leaves the whole value alone.
+        if !matches!(receipt, Ok(Receipt::Delivered | Receipt::Held)) {
             assert_eq!(self.trackers[replica], before);
         }
     }
@@ -237,8 +264,13 @@ impl World {
         let mut cursor = Some(0);
         while let Some(at) = cursor {
             let mut out = std::vec![blank; size];
-            let Ok(page) = self.trackers[replica].missing(stamp, at, &mut out) else {
-                panic!("logged stamps are well formed");
+            let page = self.trackers[replica].missing(stamp, at, &mut out);
+            let Ok(page) = page else {
+                assert_eq!(
+                    page.map(|_| ()),
+                    self.models[replica].check(stamp).map(|_| ())
+                );
+                return;
             };
             listed.extend_from_slice(&out[..page.written]);
             cursor = page.next;
@@ -271,6 +303,18 @@ impl World {
             0..=4 => self.send(replica),
             5..=15 if !self.log.is_empty() => {
                 let stamp = self.log[self.rng.below(self.log.len())];
+                // One arrival in four is a conflicting copy: of a message
+                // parked here when there is one, so that it arrives after
+                // some of the gap has filled, else of any message.
+                let held = &self.models[replica].held;
+                let stamp = match (self.rng.below(4), held.len()) {
+                    (0, 0) => self.forged(&stamp),
+                    (0, _) => {
+                        let parked = held[self.rng.below(held.len())];
+                        self.forged(&parked)
+                    }
+                    _ => stamp,
+                };
                 self.receive(replica, &stamp);
             }
             16..=17 => self.drain(replica),
@@ -282,22 +326,66 @@ impl World {
             19 if !self.log.is_empty() => {
                 let event = identity(&self.log[self.rng.below(self.log.len())]);
                 let dropped = self.models[replica].forget(event);
+                let expected = if dropped {
+                    Forgetting::Forgotten
+                } else {
+                    Forgetting::NotHeld
+                };
+                let before = self.trackers[replica].clone();
                 assert_eq!(
                     self.trackers[replica].forget(IDS[event.0], event.1),
-                    dropped
+                    Ok(expected)
                 );
+                assert_eq!(
+                    self.trackers[replica].forget(99, event.1),
+                    Err(Refusal::UnknownMember)
+                );
+                if !dropped {
+                    assert_eq!(self.trackers[replica], before);
+                }
             }
             _ => {}
         }
         self.agree(replica);
     }
 
+    /// The same sender and counter as `stamp` with fewer dependencies, so it
+    /// conflicts with `stamp` and is ready no later than it: a copy that can
+    /// arrive deliverable while the genuine message is still parked. `stamp`
+    /// itself when there is nothing to take away.
+    fn forged(&mut self, stamp: &Message) -> Message {
+        let sender = slot_of(stamp.sender);
+        let mut counters = *stamp.clock.counters();
+        // Half the forgeries depend on nobody else; the rest need one
+        // message fewer from one other replica.
+        let spared = self.rng.below(SLOTS);
+        let all = self.rng.below(2) == 0;
+        for (slot, counter) in counters.iter_mut().enumerate() {
+            if slot == sender {
+                continue;
+            }
+            if all {
+                *counter = 0;
+            } else if slot == spared {
+                *counter = counter.saturating_sub(1);
+            }
+        }
+        Message::new(
+            stamp.generation,
+            stamp.sender,
+            VersionVector::from_counters(counters),
+        )
+    }
+
     /// Replays the whole log in send order, which is a causal order, so every
-    /// replica ends on the same clock with nothing left parked.
+    /// replica ends on the same clock with nothing left parked. Draining
+    /// first lets a parked forgery, which waits for less than the genuine
+    /// message, leave before that message arrives and would be refused.
     fn settle(&mut self) {
         let log = self.log.clone();
         for replica in 0..REPLICAS {
             for stamp in &log {
+                self.drain(replica);
                 self.receive(replica, stamp);
             }
             self.drain(replica);
@@ -312,11 +400,20 @@ impl World {
 
 #[test]
 fn random_schedules_match_the_event_set_model() {
+    let mut conflicts = [0; 3];
     for seed in 1..=60_u64 {
         let mut world = World::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..600 {
             world.step();
         }
         world.settle();
+        for (total, seen) in conflicts.iter_mut().zip(world.conflicts) {
+            *total += seen;
+        }
     }
+    // Conflicting copies arrived deliverable, missing and already covered.
+    assert!(
+        conflicts.iter().all(|&n| n > 20),
+        "conflicts: {conflicts:?}"
+    );
 }

@@ -11,20 +11,20 @@ gem 'causal_machines'
 ```
 
 ```ruby
-tracker = CausalMachines::Tracker.new([1, 2, 3], 3, 0)   # members, me, generation
+tracker = CausalMachines::Causal.new([1, 2, 3], 3, 0)   # members, me, generation
 
 def on_message(tracker, stamp, payload, buffer)
   case tracker.receive(stamp)
   when :delivered then apply(payload)
   when :held      then buffer[[stamp.sender, stamp.clock]] = payload
-  when :duplicate, :already_held then return
-  else raise "tracker refused #{stamp}"
+  when :duplicate, :already_held then return   # seen before, nothing changed
+  else raise "tracker refused #{stamp}"        # every other symbol is a refusal
   end
 
-  while (released = tracker.release)
-    kind, ready = released
+  while (released = tracker.release)   # a Deliver or an Obsolete
+    ready = released.stamp
     payload = buffer.delete([ready.sender, ready.clock])
-    apply(payload) if kind == :deliver
+    apply(payload) if released.is_a?(CausalMachines::Deliver)
   end
 end
 
@@ -68,9 +68,9 @@ stateDiagram-v2
     [*] --> unseen
     unseen --> delivered: receive, dependencies delivered
     unseen --> held: receive, dependencies missing
-    unseen --> unseen: receive, hold table full, returns :full
-    held --> delivered: release, returns [:deliver, stamp]
-    held --> dropped: release after absorb, returns [:obsolete, stamp]
+    unseen --> unseen: receive refused, hold table full, returns :full
+    held --> delivered: release, returns Deliver(stamp)
+    held --> dropped: release after absorb, returns Obsolete(stamp)
     held --> unseen: forget
     delivered --> delivered: receive again, returns :duplicate
 ```
@@ -89,7 +89,7 @@ sequenceDiagram
     Note over C: :held, missing replica 1 counter 1
     A->>C: question [1,0,0]
     Note over C: :delivered
-    Note over C: release gives [:deliver, answer]
+    Note over C: release gives Deliver(answer)
     A->>C: question [1,0,0] (retry)
     Note over C: :duplicate
 ```
@@ -99,9 +99,9 @@ sequenceDiagram
 ### Stamp
 
 ```ruby
-alice = CausalMachines::Tracker.new([1, 2, 3], 1, 0)
-bob   = CausalMachines::Tracker.new([1, 2, 3], 2, 0)
-carol = CausalMachines::Tracker.new([1, 2, 3], 3, 0)
+alice = CausalMachines::Causal.new([1, 2, 3], 1, 0)
+bob   = CausalMachines::Causal.new([1, 2, 3], 2, 0)
+carol = CausalMachines::Causal.new([1, 2, 3], 3, 0)
 
 question = alice.stamp
 # => #<data CausalMachines::Stamp generation=0, sender=1, clock=[1, 0, 0]>
@@ -121,45 +121,45 @@ carol.receive(question)   # => :delivered
 carol.receive(question)   # => :duplicate
 ```
 
-`:delivered` means act on it now. `:held` means keep the payload somewhere; the tracker kept the stamp. `check(stamp)` gives the same verdict (`:deliverable`, `:duplicate`, `:missing`) without changing anything.
+`:delivered` means act on it now. `:held` means keep the payload somewhere; the tracker kept the stamp. `:already_held` and `:duplicate` are repeats: the tracker already has what you showed it, so the call is honoured and nothing changes. Anything else `receive` answers is a refusal. `check(stamp)` gives the same verdict (`:deliverable`, `:duplicate`, `:missing`) without changing anything, and the same refusals short of `:full`.
 
 ### Release
 
 ```ruby
-carol.release   # => [:deliver, answer]
+carol.release   # => #<data CausalMachines::Deliver stamp=answer>
 carol.release   # => nil
 ```
 
-After any delivery, call `release` until it returns `nil`. Each call hands back one held stamp whose dependencies have arrived, and counts it as delivered. One delivery can unblock a chain, so loop.
+After any delivery, call `release` until it returns `nil`. `nil` means nothing is ready; `release` never refuses. Each call hands back the core's `Release`: a `Deliver(stamp)` for one held stamp whose dependencies have arrived, which now counts as delivered, or an `Obsolete(stamp)` (see Absorb below). One delivery can unblock a chain, so loop.
 
 ### Missing
 
 ```ruby
-node = CausalMachines::Tracker.new([1, 2, 3], 3, 0)
+node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
 wanted = CausalMachines::Stamp.new(0, 2, [3, 4, 2])
 
-gaps, cursor = node.missing(wanted, 0, 2)
-# gaps   => [Gap(replica=1, from=1, through=3), Gap(replica=2, from=1, through=3)]
-# cursor => 2
-node.missing(wanted, cursor, 2)
-# => [[Gap(replica=3, from=1, through=2)], nil]
+page = node.missing(wanted, 0, 2)
+# page.gaps => [Gap(replica=1, from=1, through=3), Gap(replica=2, from=1, through=3)]
+# page.next => 2
+node.missing(wanted, page.next, 2)
+# => Page(gaps=[Gap(replica=3, from=1, through=2)], next=nil)
 ```
 
-`missing(stamp, cursor, limit)` lists what stands between you and that message: per replica, the inclusive run of counters not delivered here. Start at cursor 0, take at most `limit` gaps a call (up to `CausalMachines::MEMBERS`), and pass the returned cursor back until it is `nil`. These are the ranges to ask your peers for.
+`missing(stamp, cursor, limit)` lists what stands between you and that message: per replica, the inclusive run of counters not delivered here. It answers a `Page`. Start at cursor 0, take at most `limit` gaps a call (up to `CausalMachines::MEMBERS`), and pass `page.next` back until it is `nil`. These are the ranges to ask your peers for.
 
 ### Absorb
 
 ```ruby
-node = CausalMachines::Tracker.new([1, 2, 3], 3, 0)
+node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
 late = CausalMachines::Stamp.new(0, 1, [2, 0, 0])
 node.receive(late)            # => :held
 
-node.absorb(0, [4, 0, 0])     # => true, a snapshot already covers 1..4 from replica 1
+node.absorb(0, [4, 0, 0])     # => :absorbed, a snapshot already covers 1..4 from replica 1
 node.clock                    # => [4, 0, 0]
-node.release                  # => [:obsolete, late]
+node.release                  # => #<data CausalMachines::Obsolete stamp=late>
 ```
 
-When you install state that already reflects a clock, `absorb` folds that clock into yours by taking the larger counter in every position. Held stamps it covers come out of `release` as `:obsolete`: drop their payloads, do not apply them.
+When you install state that already reflects a clock, `absorb` folds that clock into yours by taking the larger counter in every position. Held stamps it covers come out of `release` as `Obsolete(stamp)`: drop their payloads, do not apply them. An honoured `absorb` answers `:absorbed`, also when the clock taught it nothing new.
 
 ### Compare and merge
 
@@ -175,30 +175,63 @@ Plain version-vector arithmetic on Arrays of the same length. `compare` answers 
 
 ### Capacity
 
-The tracker holds 64 early stamps and up to 8 members. Past that, `receive` says `:full` and changes nothing:
+The tracker holds 64 early stamps and up to 8 members. Past that, `receive` refuses a stamp that would have to wait with `:full`:
 
 ```ruby
-node = CausalMachines::Tracker.new([1, 2, 3], 3, 0)
+node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
 CausalMachines::CAPACITY   # => 64
 CausalMachines::MEMBERS    # => 8
 (2..65).each { |n| node.receive(CausalMachines::Stamp.new(0, 1, [n, 0, 0])) }
 node.receive(CausalMachines::Stamp.new(0, 1, [66, 0, 0]))   # => :full
 
-node.forget(1, 65)                                          # => true
+node.forget(1, 65)                                          # => :forgotten
+node.forget(1, 65)                                          # => :not_held, nothing changed
 node.receive(CausalMachines::Stamp.new(0, 1, [66, 0, 0]))   # => :held
 ```
 
-A held stamp is never evicted to make room. `forget(sender, counter)` drops one you have decided to stop waiting for; the sender will have to send it again.
+A held stamp is never evicted to make room. `forget(sender, counter)` drops one you have decided to stop waiting for; the sender will have to send it again. It answers `:forgotten` when it dropped one and `:not_held` when none was held. Both are honoured: asking to forget a stamp that isn't held is a repeat that changes nothing. A sender outside the membership is refused with `:unknown_member`.
+
+### Conflict
+
+```ruby
+node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
+waiting = CausalMachines::Stamp.new(0, 1, [2, 1, 0])
+node.receive(waiting)                                       # => :held
+node.receive(CausalMachines::Stamp.new(0, 1, [1, 0, 0]))    # => :delivered
+
+other = CausalMachines::Stamp.new(0, 1, [2, 0, 0])   # same sender, same counter, another clock
+node.check(other)        # => :conflict
+node.receive(other)      # => :conflict, though nothing it depends on is missing
+node.held                # => 1, the held stamp is still there
+node.forget(1, 2)        # => :forgotten, you have chosen
+node.receive(other)      # => :delivered
+```
+
+Two stamps with the same sender and counter but different clocks cannot both be that sender's message, and the tracker has no way to know which one is. So it refuses the newcomer with `:conflict` whatever it would otherwise have been, ready to deliver, waiting, or already covered, and it never drops or replaces the held stamp to make the answer simpler. `check` and `missing` refuse the same way. The held stamp leaves only through `release`, or through `forget` when you decide the other one is right.
 
 ### Generations
 
 ```ruby
-node = CausalMachines::Tracker.new([1, 2, 3], 3, 5)
+node = CausalMachines::Causal.new([1, 2, 3], 3, 5)
 node.receive(CausalMachines::Stamp.new(4, 1, [1, 0, 0]))   # => :stale_generation
 node.receive(CausalMachines::Stamp.new(6, 1, [1, 0, 0]))   # => :future_generation
 node.receive(CausalMachines::Stamp.new(5, 9, [1, 0, 0]))   # => :unknown_member
 node.receive(CausalMachines::Stamp.new(5, 1, [0, 1, 0]))   # => :malformed
 ```
+
+### What each call can answer
+
+| Call | Honoured | Refusals |
+| --- | --- | --- |
+| `stamp` | a `Stamp` | `:exhausted` |
+| `check` | `:deliverable`, `:duplicate`, `:missing` | `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` |
+| `receive` | `:delivered`, `:held`, `:already_held`, `:duplicate` | `:conflict`, `:full`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` |
+| `release` | `Deliver(stamp)`, `Obsolete(stamp)`, `nil` | none |
+| `forget` | `:forgotten`, `:not_held` | `:unknown_member` |
+| `missing` | a `Page` (`gaps`, `next`) | `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` |
+| `absorb` | `:absorbed` | `:stale_generation`, `:future_generation` |
+
+Each refusal is the snake_case of one core `Refusal` variant. There is no catch-all symbol. `absorb` cannot answer the core's `Malformed`: a clock of the wrong length raises `RangeError` first.
 
 Membership is fixed for the life of a tracker. Vectors from a different set of replicas mean nothing here, so the member list carries a generation number and stamps from any other generation are refused. Changing the membership means agreeing on a new generation somewhere else and building new trackers.
 
@@ -206,8 +239,9 @@ Membership is fixed for the life of a tracker. Vectors from a different set of r
 
 - **Ids, generations and counters are Integers** in `0..2**64-1`. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`, and so does a clock whose length is not the member count.
 - **Members are distinct and include you.** Duplicate members or a local id outside the list raise `ArgumentError`.
-- **Refusals don't raise.** `:full`, `:conflict`, `:duplicate`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` and `:exhausted` are answers. A refused call changes nothing.
-- **One stamp per sender and counter.** A second stamp with the same sender and counter but a different clock is a `:conflict` while the first is held.
+- **Refusals don't raise.** `:full`, `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` and `:exhausted` are answers. A refused call changes nothing. `:duplicate`, `:already_held` and `:not_held` are not refusals: the call was honoured and there was nothing left to do.
+- **Mutating calls never answer a boolean.** Every answer is a value or a symbol, so no refusal can pass for `true` in an `if`. Only the predicates `dominates?` and `concurrent?` answer `true` or `false`.
+- **One stamp per sender and counter.** A second stamp with the same sender and counter but a different clock is a `:conflict` while the first is held, even when the second could be delivered on the spot. The held one is never dropped for it.
 - **Frozen means frozen.** `freeze` the tracker and `stamp`, `receive`, `release`, `forget` and `absorb` raise `FrozenError`. `check` and `missing` still answer.
 
 ## What You Think You're Doing vs Reality
@@ -219,7 +253,7 @@ Two messages with timestamps 5 and 6 might be a question and its answer, or two 
 
 ## What's Yours
 
-The tracker lives in your process and forgets everything when the process does. Persist `clock` and rebuild with `Tracker.restore` if a restart must not reuse counters or redeliver. Payloads, the buffer that holds them while their stamp waits, the network, retransmission of the gaps `missing` reports, and any agreement on who the members are: all yours. This is an initial release with an unstable API. It is the rulebook for causal order, not a broadcast runtime.
+The tracker lives in your process and forgets everything when the process does. Persist `clock` and rebuild with `Causal.restore` if a restart must not reuse counters or redeliver. Payloads, the buffer that holds them while their stamp waits, the network, retransmission of the gaps `missing` reports, and any agreement on who the members are: all yours. This is an initial release with an unstable API. It is the rulebook for causal order, not a broadcast runtime.
 
 ## License
 

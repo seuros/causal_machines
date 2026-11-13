@@ -2,13 +2,13 @@
 require 'minitest/autorun'
 require 'causal_machines'
 
-class TrackerTest < Minitest::Test
+class CausalTest < Minitest::Test
   include CausalMachines
 
   MAX = 2**64 - 1
 
   def tracker(local, members: [1, 2, 3], generation: 0)
-    Tracker.new(members, local, generation)
+    Causal.new(members, local, generation)
   end
 
   def stamp(sender, clock, generation: 0)
@@ -20,7 +20,7 @@ class TrackerTest < Minitest::Test
     assert_equal 8, MEMBERS
     assert_equal 64, CAPACITY
     assert_equal 64, node.capacity
-    assert_equal [1, 2, 3], node.members
+    assert_equal [1, 2, 3], node.membership
     assert_equal 2, node.local
     assert_equal 9, node.generation
     assert_equal [0, 0, 0], node.clock
@@ -42,10 +42,10 @@ class TrackerTest < Minitest::Test
     assert_equal :already_held, carol.receive(answer)
     assert_equal 1, carol.held
     assert_nil carol.release
-    assert_equal [[Gap.new(1, 1, 1)], nil], carol.missing(answer, 0, 8)
+    assert_equal Page.new([Gap.new(1, 1, 1)], nil), carol.missing(answer, 0, 8)
     assert_equal :deliverable, carol.check(question)
     assert_equal :delivered, carol.receive(question)
-    assert_equal [:deliver, answer], carol.release
+    assert_equal CausalMachines::Deliver.new(answer), carol.release
     assert_nil carol.release
     assert_equal [1, 1, 0], carol.clock
     assert_equal :duplicate, carol.receive(question)
@@ -56,12 +56,15 @@ class TrackerTest < Minitest::Test
   def test_missing_pages_resume_from_the_cursor
     node = tracker(3)
     wanted = stamp(2, [3, 4, 2])
-    first, cursor = node.missing(wanted, 0, 2)
-    assert_equal [Gap.new(1, 1, 3), Gap.new(2, 1, 3)], first
-    assert_equal 2, cursor
-    assert_equal [[Gap.new(3, 1, 2)], nil], node.missing(wanted, cursor, 2)
-    assert_equal [[], 0], node.missing(wanted, 0, 0)
-    assert_equal [[], nil], node.missing(stamp(1, [1, 0, 0]), 0, 8)
+    first = node.missing(wanted, 0, 2)
+    assert_instance_of Page, first
+    assert_equal %i[gaps next], Page.members
+    assert_equal [[:stamp], [:stamp]], [CausalMachines::Deliver.members, CausalMachines::Obsolete.members]
+    assert_equal [Gap.new(1, 1, 3), Gap.new(2, 1, 3)], first.gaps
+    assert_equal 2, first.next
+    assert_equal Page.new([Gap.new(3, 1, 2)], nil), node.missing(wanted, first.next, 2)
+    assert_equal Page.new([], 0), node.missing(wanted, 0, 0)
+    assert_equal Page.new([], nil), node.missing(stamp(1, [1, 0, 0]), 0, 8)
     assert_raises(RangeError) { node.missing(wanted, 0, 9) }
   end
 
@@ -71,18 +74,23 @@ class TrackerTest < Minitest::Test
     assert_equal 64, node.held
     assert_equal :full, node.receive(stamp(1, [66, 0, 0]))
     assert_equal :conflict, node.receive(stamp(1, [2, 1, 0]))
+    assert_equal :already_held, node.receive(stamp(1, [2, 0, 0]))
     assert_equal 64, node.held
     assert_equal [0, 0, 0], node.clock
-    assert node.forget(1, 65)
-    refute node.forget(1, 65)
-    refute node.forget(99, 1)
+    assert_equal :unknown_member, node.forget(99, 1)
+    assert_equal :not_held, node.forget(2, 65)
+    assert_equal 64, node.held
+    assert_equal :forgotten, node.forget(1, 65)
+    assert_equal 63, node.held
+    assert_equal :not_held, node.forget(1, 65)
+    assert_equal 63, node.held
     assert_equal :held, node.receive(stamp(1, [66, 0, 0]))
     assert_equal :delivered, node.receive(stamp(1, [1, 0, 0]))
     released = []
     while (out = node.release)
       released << out
     end
-    assert_equal((2..64).map { |n| [:deliver, stamp(1, [n, 0, 0])] }, released)
+    assert_equal((2..64).map { |n| CausalMachines::Deliver.new(stamp(1, [n, 0, 0])) }, released)
     assert_equal 1, node.held
   end
 
@@ -90,9 +98,10 @@ class TrackerTest < Minitest::Test
     node = tracker(3)
     late = stamp(1, [2, 0, 0])
     assert_equal :held, node.receive(late)
-    assert_equal true, node.absorb(0, [4, 0, 0])
+    assert_equal :absorbed, node.absorb(0, [4, 0, 0])
+    assert_equal :absorbed, node.absorb(0, [4, 0, 0])
     assert_equal [4, 0, 0], node.clock
-    assert_equal [:obsolete, late], node.release
+    assert_equal CausalMachines::Obsolete.new(late), node.release
     assert_nil node.release
     assert_equal :stale_generation, tracker(3, generation: 2).absorb(1, [1, 0, 0])
     assert_equal :future_generation, node.absorb(1, [1, 0, 0])
@@ -116,32 +125,44 @@ class TrackerTest < Minitest::Test
     assert_equal 0, node.held
   end
 
+  def test_no_mutating_call_answers_a_boolean
+    node = tracker(3)
+    late = stamp(1, [2, 0, 0])
+    answers = [
+      node.stamp, node.receive(late), node.receive(late), node.forget(1, 2), node.forget(1, 2),
+      node.forget(9, 2), node.absorb(0, [1, 0, 0]), node.absorb(1, [1, 0, 0]), node.release
+    ]
+    assert_empty(answers.select { [true, false].include?(_1) })
+    assert_equal %i[held already_held forgotten not_held unknown_member absorbed future_generation],
+                 answers.grep(Symbol)
+  end
+
   def test_restore_and_u64_limits
-    node = Tracker.restore([1, 2], 1, 0, [MAX - 1, 0])
+    node = Causal.restore([1, 2], 1, 0, [MAX - 1, 0])
     last = node.stamp
     assert_equal [MAX, 0], last.clock
     assert_equal :exhausted, node.stamp
     assert_equal [MAX, 0], node.clock
-    peer = Tracker.new([1, 2], 2, 0)
+    peer = Causal.new([1, 2], 2, 0)
     assert_equal :held, peer.receive(last)
-    assert_equal [[Gap.new(1, 1, MAX - 1)], nil], peer.missing(last, 0, 8)
-    assert_equal true, peer.absorb(0, [MAX - 1, 0])
-    assert_equal [:deliver, last], peer.release
+    assert_equal Page.new([Gap.new(1, 1, MAX - 1)], nil), peer.missing(last, 0, 8)
+    assert_equal :absorbed, peer.absorb(0, [MAX - 1, 0])
+    assert_equal CausalMachines::Deliver.new(last), peer.release
     assert_equal [MAX, 0], peer.clock
   end
 
   def test_strict_inputs
-    assert_raises(ArgumentError) { Tracker.new([1, 1], 1, 0) }
-    assert_raises(ArgumentError) { Tracker.new([1, 2], 3, 0) }
-    assert_raises(RangeError) { Tracker.new((1..9).to_a, 1, 0) }
-    assert_raises(RangeError) { Tracker.restore([1, 2], 1, 0, [0]) }
-    assert_raises(TypeError) { Tracker.new(nil, 1, 0) }
-    assert_raises(TypeError) { Tracker.allocate }
+    assert_raises(ArgumentError) { Causal.new([1, 1], 1, 0) }
+    assert_raises(ArgumentError) { Causal.new([1, 2], 3, 0) }
+    assert_raises(RangeError) { Causal.new((1..9).to_a, 1, 0) }
+    assert_raises(RangeError) { Causal.restore([1, 2], 1, 0, [0]) }
+    assert_raises(TypeError) { Causal.new(nil, 1, 0) }
+    assert_raises(TypeError) { Causal.allocate }
     node = tracker(1)
     [1.0, Float::NAN, nil, '1', Object.new].each do |bad|
-      assert_raises(TypeError) { Tracker.new([1, bad], 1, 0) }
-      assert_raises(TypeError) { Tracker.new([1, 2], bad, 0) }
-      assert_raises(TypeError) { Tracker.new([1, 2], 1, bad) }
+      assert_raises(TypeError) { Causal.new([1, bad], 1, 0) }
+      assert_raises(TypeError) { Causal.new([1, 2], bad, 0) }
+      assert_raises(TypeError) { Causal.new([1, 2], 1, bad) }
       assert_raises(TypeError) { node.receive(bad) }
       assert_raises(TypeError) { node.check(bad) }
       assert_raises(TypeError) { node.receive(stamp(bad, [1, 0, 0])) }
@@ -169,7 +190,7 @@ class TrackerTest < Minitest::Test
     assert_raises(FrozenError) { node.forget(2, 1) }
     assert_raises(FrozenError) { node.absorb(0, [0, 0, 0]) }
     assert_equal :deliverable, node.check(incoming)
-    assert_equal [[], nil], node.missing(incoming, 0, 8)
+    assert_equal Page.new([], nil), node.missing(incoming, 0, 8)
     assert_equal [0, 0, 0], node.clock
   end
 
@@ -182,7 +203,7 @@ class TrackerTest < Minitest::Test
     assert_equal :held, peer.receive(stamp(1, [2, 0, 0]))
     assert_equal :delivered, peer.receive(sent)
     GC.compact
-    assert_equal [:deliver, stamp(1, [2, 0, 0])], peer.release
+    assert_equal CausalMachines::Deliver.new(stamp(1, [2, 0, 0])), peer.release
   ensure
     GC.stress = previous
   end

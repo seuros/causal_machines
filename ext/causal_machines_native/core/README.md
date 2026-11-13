@@ -17,16 +17,49 @@ slots for the stamps of messages that arrived ahead of their dependencies. A
 stamp is `Deliverable` when it is the sender's next message and everything the
 sender had delivered is delivered here; `Duplicate` when the delivered clock
 already covers it; otherwise `Missing`. `receive` delivers or parks, `release`
-hands back parked stamps one at a time as their dependencies arrive, and
+hands back parked stamps one at a time as their dependencies arrive (`None`
+means nothing is ready), `forget` drops a parked stamp and says whether there
+was one (`Forgetting::Forgotten` or `Forgetting::NotHeld`), and
 `missing` lists the undelivered runs per replica into a caller buffer, resumable
 by cursor. It writes the first `Page::written` entries of `out` and leaves the
 rest untouched; build the buffer as `[Gap::default(); K]`. The default is a
 placeholder the core never emits, because counters start at 1.
 
-Refusals are explicit and leave state untouched: a full hold table answers
-`Full`, a stamp from another membership generation answers `StaleGeneration` or
-`FutureGeneration`, an unknown sender `UnknownMember`, a clock counting outside
-the membership `Malformed`, and a counter at `u64::MAX` `Exhausted`.
+`Refusal` is the only refusal type, and no public enum is `#[non_exhaustive]`:
+a new variant is a breaking change every caller matches on. A refused call was not honoured and leaves
+the whole value untouched; `Causal` is `PartialEq`, so comparing against a
+clone proves it. A stamp from another membership generation is refused with
+`StaleGeneration` or `FutureGeneration`, an unknown sender with
+`UnknownMember`, a clock counting outside the membership (or a zero sender
+entry) with `Malformed`, and a counter at `u64::MAX` with `Exhausted`. A stamp
+that must wait is refused with `Full` when no hold slot is free.
+
+A stamp is refused with `Conflict` when a different stamp with the same sender
+and counter is parked, on every path: whether the incoming stamp would have
+been delivered, parked, or called a duplicate. Two stamps numbered alike with
+different clocks cannot both be the sender's message, and the tracker cannot
+tell which is, so it never drops or replaces the parked one for the other.
+`check` and `missing` refuse the same way, so `check` answers what `receive`
+would do. Parked stamps leave the hold table three ways only: handed back by
+`release` (`Deliver` or `Obsolete`), dropped by name with `forget`, which is
+how a caller resolves a conflict in favour of the refused stamp, or delivered
+by `receive` when the identical stamp arrives again and is now ready. `absorb`
+never touches the hold table.
+
+| Operation | Honoured | Refusals |
+| --- | --- | --- |
+| `stamp() -> Result<Stamp, Refusal>` | the stamp | `Exhausted` |
+| `check(&stamp) -> Result<Readiness, Refusal>` | `Deliverable`, `Duplicate`, `Missing` | `StaleGeneration`, `FutureGeneration`, `UnknownMember`, `Malformed`, `Conflict` |
+| `receive(&stamp) -> Result<Receipt, Refusal>` | `Delivered`, `Held`, `AlreadyHeld`, `Duplicate` | as `check`, plus `Full` |
+| `release() -> Option<Release>` | a release, or `None` when nothing is ready | none |
+| `forget(sender, counter) -> Result<Forgetting, Refusal>` | `Forgotten`, `NotHeld` | `UnknownMember` |
+| `missing(&stamp, cursor, out) -> Result<Page, Refusal>` | the page | as `check` |
+| `absorb(generation, &clock) -> Result<(), Refusal>` | `()` | `StaleGeneration`, `FutureGeneration`, `Malformed` |
+
+`Receipt::AlreadyHeld`, `Receipt::Duplicate` and `Forgetting::NotHeld` are
+idempotent repeats: what the caller asked for already holds, so the call is
+honoured and changes nothing. In Ruby the honoured outcomes are the symbols
+`:forgotten` and `:not_held` for `forget`, and `:absorbed` for `absorb`.
 
 This is a policy core. It stores stamps, never payloads. It has no transport, no
 retransmission, no persistence, no clock and no membership change protocol. The

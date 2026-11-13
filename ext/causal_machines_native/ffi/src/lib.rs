@@ -4,7 +4,9 @@ mod vectors;
 
 use std::cell::RefCell;
 
-use causal_machines::{Causal, Gap, Membership, Readiness, Receipt, Refusal, Release, Stamp};
+use causal_machines::{
+    Causal, Forgetting, Gap, Membership, Readiness, Receipt, Refusal, Release, Stamp,
+};
 use magnus::{Error, RArray, RClass, RModule, Ruby, Value, prelude::*, typed_data::Obj};
 use vectors::{Clock, Number, array, clock, numbers};
 
@@ -18,18 +20,21 @@ fn data_class(ruby: &Ruby, name: &str) -> Result<RClass, Error> {
     module.const_get(name)
 }
 
+/// The snake case of the core variant.
 fn refusal(ruby: &Ruby, refusal: Refusal) -> Value {
     let name = match refusal {
         Refusal::UnknownMember => "unknown_member",
         Refusal::StaleGeneration => "stale_generation",
         Refusal::FutureGeneration => "future_generation",
         Refusal::Exhausted => "exhausted",
-        _ => "malformed",
+        Refusal::Conflict => "conflict",
+        Refusal::Malformed => "malformed",
+        Refusal::Full => "full",
     };
     ruby.to_symbol(name).as_value()
 }
 
-#[magnus::wrap(class = "CausalMachines::Tracker", free_immediately, size)]
+#[magnus::wrap(class = "CausalMachines::Causal", free_immediately, size)]
 struct Tracker {
     core: RefCell<Core>,
 }
@@ -99,32 +104,39 @@ impl Tracker {
             Ok(Receipt::Held) => "held",
             Ok(Receipt::AlreadyHeld) => "already_held",
             Ok(Receipt::Duplicate) => "duplicate",
-            Ok(Receipt::Conflict) => "conflict",
-            Ok(_) => "full",
             Err(why) => return Ok(refusal(ruby, why)),
         };
         Ok(ruby.to_symbol(name).as_value())
     }
 
-    fn release(ruby: &Ruby, this: Obj<Self>) -> Result<Option<RArray>, Error> {
+    /// A `Deliver` or an `Obsolete` wrapping the stamp, or `nil`.
+    fn release(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
         this.check_frozen()?;
         let released = this.core.borrow_mut().release();
         let Some(released) = released else {
             return Ok(None);
         };
         let (name, stamp) = match released {
-            Release::Deliver(stamp) => ("deliver", stamp),
-            Release::Obsolete(stamp) => ("obsolete", stamp),
+            Release::Deliver(stamp) => ("Deliver", stamp),
+            Release::Obsolete(stamp) => ("Obsolete", stamp),
         };
-        let pair = ruby.ary_new_capa(2);
-        pair.push(ruby.to_symbol(name))?;
-        pair.push(this.wrap(ruby, &stamp)?)?;
-        Ok(Some(pair))
+        let stamp = this.wrap(ruby, &stamp)?;
+        data_class(ruby, name)?.funcall("new", (stamp,)).map(Some)
     }
 
-    fn forget(this: Obj<Self>, sender: Number, counter: Number) -> Result<bool, Error> {
+    fn forget(
+        ruby: &Ruby,
+        this: Obj<Self>,
+        sender: Number,
+        counter: Number,
+    ) -> Result<Value, Error> {
         this.check_frozen()?;
-        Ok(this.core.borrow_mut().forget(sender.0, counter.0))
+        let name = match this.core.borrow_mut().forget(sender.0, counter.0) {
+            Ok(Forgetting::Forgotten) => "forgotten",
+            Ok(Forgetting::NotHeld) => "not_held",
+            Err(why) => return Ok(refusal(ruby, why)),
+        };
+        Ok(ruby.to_symbol(name).as_value())
     }
 
     fn missing(
@@ -155,10 +167,7 @@ impl Tracker {
             listed
                 .push(class.funcall::<_, _, Value>("new", (gap.replica, gap.from, gap.through))?)?;
         }
-        let answer = ruby.ary_new_capa(2);
-        answer.push(listed)?;
-        answer.push(page.next)?;
-        Ok(answer.as_value())
+        data_class(ruby, "Page")?.funcall("new", (listed, page.next))
     }
 
     fn absorb(
@@ -170,7 +179,7 @@ impl Tracker {
         this.check_frozen()?;
         let seen = clock(ruby, seen, this.len())?;
         Ok(match this.core.borrow_mut().absorb(generation.0, &seen) {
-            Ok(()) => ruby.qtrue().as_value(),
+            Ok(()) => ruby.to_symbol("absorbed").as_value(),
             Err(why) => refusal(ruby, why),
         })
     }
@@ -184,7 +193,7 @@ impl Tracker {
         self.core.borrow().held()
     }
 
-    fn members(ruby: &Ruby, this: Obj<Self>) -> Result<RArray, Error> {
+    fn membership(ruby: &Ruby, this: Obj<Self>) -> Result<RArray, Error> {
         let out = ruby.ary_new_capa(this.len());
         for id in this.core.borrow().membership().ids() {
             out.push(*id)?;
