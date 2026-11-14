@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/causal_machines/compare/causal-machines-v0.4.0...causal-machines-v0.5.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* validate Page and Gap in the core, refuse unissued missing cursors, seal values, clone-then-keep stamp/release
+
+### Features
+
+* validate Page and Gap in the core, refuse unissued missing cursors, seal values, clone-then-keep stamp/release ([87b24f6](https://github.com/seuros/causal_machines/commit/87b24f6c6c4c295e142fdafa01de7ab5e2dee17b))
+
 ## [0.4.0](https://github.com/seuros/causal_machines/compare/causal-machines-v0.3.0...causal-machines-v0.4.0) (2026-11-13)
 
 
