@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.4.0...causal_machines/v0.5.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona 0.3 integer_in for the missing limit
+
+### Features
+
+* adopt matryona 0.3 integer_in for the missing limit ([af296fc](https://github.com/seuros/causal_machines/commit/af296fc8d2d545e22594a39cf4f3bb271dd6cefc))
+
 ## [0.4.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.3.0...causal_machines/v0.4.0) (2026-11-14)
 
 
