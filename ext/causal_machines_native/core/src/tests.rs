@@ -4,6 +4,7 @@ mod conflict;
 mod model;
 
 use super::*;
+use matryona_machines::testing::{refuses, unchanged};
 
 type Vv = VersionVector<4>;
 type Node = Causal<4, 2>;
@@ -102,10 +103,8 @@ fn increment_refuses_unknown_slots_and_exhausted_counters() {
     let mut clock = Vv::from_counters([0, u64::MAX - 1, 0, 0]);
     assert_eq!(clock.increment(0), Ok(1));
     assert_eq!(clock.increment(1), Ok(u64::MAX));
-    let before = clock;
-    assert_eq!(clock.increment(1), Err(Refusal::Exhausted));
-    assert_eq!(clock.increment(4), Err(Refusal::UnknownMember));
-    assert_eq!(clock, before);
+    refuses(&mut clock, Refusal::Exhausted, |c| c.increment(1));
+    refuses(&mut clock, Refusal::UnknownMember, |c| c.increment(4));
 }
 
 #[test]
@@ -153,24 +152,33 @@ fn a_full_hold_table_refuses_without_mutating() {
     let mut c = node(C);
     assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::Held));
     assert_eq!(c.receive(&stamp(A, [3, 0, 0, 0])), Ok(Receipt::Held));
-    let before = c.clone();
-    assert_eq!(c.receive(&stamp(A, [4, 0, 0, 0])), Err(Refusal::Full));
-    assert_eq!(c, before);
-    assert_eq!(c.receive(&stamp(A, [2, 1, 0, 0])), Err(Refusal::Conflict));
-    assert_eq!(c, before);
+    refuses(&mut c, Refusal::Full, |c| {
+        c.receive(&stamp(A, [4, 0, 0, 0]))
+    });
+    refuses(&mut c, Refusal::Conflict, |c| {
+        c.receive(&stamp(A, [2, 1, 0, 0]))
+    });
     // Idempotent repeats are honoured and change nothing either.
-    assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::AlreadyHeld));
-    assert_eq!(c, before);
-    assert_eq!(c.forget(99, 3), Err(Refusal::UnknownMember));
-    assert_eq!(c.forget(B, 3), Ok(Forgetting::NotHeld));
-    assert_eq!(c.forget(A, 9), Ok(Forgetting::NotHeld));
-    assert_eq!(c, before);
+    assert_eq!(
+        unchanged(&mut c, |c| c.receive(&stamp(A, [2, 0, 0, 0]))),
+        Ok(Receipt::AlreadyHeld)
+    );
+    refuses(&mut c, Refusal::UnknownMember, |c| c.forget(99, 3));
+    assert_eq!(
+        unchanged(&mut c, |c| c.forget(B, 3)),
+        Ok(Forgetting::NotHeld)
+    );
+    assert_eq!(
+        unchanged(&mut c, |c| c.forget(A, 9)),
+        Ok(Forgetting::NotHeld)
+    );
 
     assert_eq!(c.forget(A, 3), Ok(Forgetting::Forgotten));
     assert_eq!(c.held(), 1);
-    let forgotten = c.clone();
-    assert_eq!(c.forget(A, 3), Ok(Forgetting::NotHeld));
-    assert_eq!(c, forgotten);
+    assert_eq!(
+        unchanged(&mut c, |c| c.forget(A, 3)),
+        Ok(Forgetting::NotHeld)
+    );
     assert_eq!(c.receive(&stamp(A, [4, 0, 0, 0])), Ok(Receipt::Held));
     assert_eq!(c.receive(&stamp(A, [1, 0, 0, 0])), Ok(Receipt::Delivered));
     assert_eq!(c.release(), Some(Release::Deliver(stamp(A, [2, 0, 0, 0]))));
@@ -188,7 +196,6 @@ fn a_full_hold_table_refuses_without_mutating() {
 #[test]
 fn stale_future_unknown_and_malformed_stamps_are_refused_untouched() {
     let mut c = node(C);
-    let before = c.clone();
     let good = Vv::from_counters([1, 0, 0, 0]);
     let cases = [
         (Stamp::new(6, A, good), Refusal::StaleGeneration),
@@ -199,14 +206,13 @@ fn stale_future_unknown_and_malformed_stamps_are_refused_untouched() {
     ];
     for (bad, why) in cases {
         assert_eq!(c.check(&bad), Err(why));
-        assert_eq!(c.receive(&bad), Err(why));
+        refuses(&mut c, why, |c| c.receive(&bad));
         assert_eq!(c.missing(&bad, 0, &mut []), Err(why));
     }
-    assert_eq!(c.absorb(6, &good), Err(Refusal::StaleGeneration));
-    assert_eq!(c.absorb(8, &good), Err(Refusal::FutureGeneration));
+    refuses(&mut c, Refusal::StaleGeneration, |c| c.absorb(6, &good));
+    refuses(&mut c, Refusal::FutureGeneration, |c| c.absorb(8, &good));
     let outside = Vv::from_counters([0, 0, 0, 1]);
-    assert_eq!(c.absorb(7, &outside), Err(Refusal::Malformed));
-    assert_eq!(c, before);
+    refuses(&mut c, Refusal::Malformed, |c| c.absorb(7, &outside));
     assert_eq!(std::format!("{}", Refusal::Malformed), "malformed clock");
     assert_eq!(std::format!("{}", Refusal::Full), "hold table full");
 }
@@ -309,9 +315,7 @@ fn counters_at_the_u64_limit_neither_wrap_nor_reissue() {
     let mut a = Node::restore(members(), A, 7, top).expect("clock stays inside the membership");
     let last = sent(&mut a);
     assert_eq!(last.clock.get(0), Some(u64::MAX));
-    let before = a.clone();
-    assert_eq!(a.stamp(), Err(Refusal::Exhausted));
-    assert_eq!(a, before);
+    refuses(&mut a, Refusal::Exhausted, Node::stamp);
 
     let mut c = node(C);
     assert_eq!(c.receive(&last), Ok(Receipt::Held));
@@ -329,18 +333,19 @@ fn covered_clocks_and_stamps_are_honoured_repeats() {
         c.absorb(7, &Vv::from_counters([4, 1, 0, 0])),
         Ok(Absorbing::Absorbed)
     );
-    let before = c.clone();
     for covered in [[4, 1, 0, 0], [2, 0, 0, 0], [0, 0, 0, 0]] {
         assert_eq!(
-            c.absorb(7, &Vv::from_counters(covered)),
+            unchanged(&mut c, |c| c.absorb(7, &Vv::from_counters(covered))),
             Ok(Absorbing::AlreadyCovered)
         );
-        assert_eq!(c, before);
     }
     // An older stamp after a newer one is a duplicate, whatever it depends on.
-    assert_eq!(c.receive(&stamp(A, [3, 0, 0, 0])), Ok(Receipt::Duplicate));
-    assert_eq!(c.receive(&stamp(A, [4, 5, 0, 0])), Ok(Receipt::Duplicate));
-    assert_eq!(c, before);
+    for older in [[3, 0, 0, 0], [4, 5, 0, 0]] {
+        assert_eq!(
+            unchanged(&mut c, |c| c.receive(&stamp(A, older))),
+            Ok(Receipt::Duplicate)
+        );
+    }
     assert_eq!(
         c.absorb(7, &Vv::from_counters([3, 2, 0, 0])),
         Ok(Absorbing::Absorbed)

@@ -212,6 +212,22 @@ class CausalTest < Minitest::Test
     assert_equal vv([0, 0, 0]), node.clock
   end
 
+  # Frozen is checked before any argument is read, as Ruby's own methods do.
+  def test_a_frozen_tracker_given_a_bad_argument_raises_frozen_error
+    node = tracker(1).freeze
+    assert_raises(FrozenError) { node.receive(:bad) }
+    assert_raises(FrozenError) { node.forget(1.5, nil) }
+    assert_raises(FrozenError) { node.absorb(-1, :bad) }
+  end
+
+  # An Array subclass could answer for its elements; only an Array is read.
+  def test_an_array_subclass_is_a_type_error
+    list = Class.new(Array)
+    assert_raises(TypeError) { VersionVector.new(list.new([1, 2])) }
+    assert_raises(TypeError) { Membership.new(list.new([1, 2])) }
+    assert_raises(TypeError) { Page.new(list.new([Gap.new(1, 1, 2)]), nil) }
+  end
+
   def test_gc_stress
     previous = GC.stress
     GC.stress = true

@@ -39,12 +39,52 @@ class ValuesTest < Minitest::Test
     end
   end
 
-  # `Marshal.load` builds an instance of the real class without `initialize`;
-  # the binding rebuilds every value it reads through the core.
   # A singleton class opened on a value does not change what it is.
   def test_an_opened_singleton_class_is_still_the_gems_value
     assert_equal :absorbed, tracker(1).absorb(0, vv([0, 1, 0]).tap(&:singleton_class))
+    assert_equal :delivered, tracker(1).receive(stamp(2, [0, 1, 0]).tap(&:singleton_class))
+    assert_equal 2, Causal.new(Membership.new([1, 2]).tap(&:singleton_class), 1, 0).membership.len
+    assert_equal 1, Page.new([Gap.new(1, 1, 2).tap(&:singleton_class)], nil).gaps.size
   end
+
+  # Fields are read from the struct itself: a redefined reader is never
+  # called, so it can neither lie nor re-enter.
+  def test_a_redefined_reader_is_ignored
+    node = tracker(1)
+    clock = vv([0, 1, 0])
+    sent = stamp(2, [0, 1, 0])
+    members = Membership.new([1, 2, 3])
+    gap = Gap.new(1, 1, 2)
+    readers = { VersionVector => %i[counters], Stamp => %i[generation sender clock],
+                Membership => %i[ids], Gap => %i[replica from through] }
+    redefined(readers) do
+      assert_equal :absorbed, node.absorb(0, clock)
+      assert_equal :duplicate, node.receive(sent)
+      assert_equal :before, vv([0, 0, 0]).compare(clock)
+      assert_equal 3, Causal.new(members, 1, 0).membership.len
+      assert_equal 1, Page.new([gap], nil).gaps.size
+    end
+  end
+
+  def redefined(readers)
+    readers.each do |klass, names|
+      names.each do |name|
+        klass.alias_method(:"__real_#{name}", name)
+        klass.define_method(name) { raise "#{name} reader called" }
+      end
+    end
+    yield
+  ensure
+    readers.each do |klass, names|
+      names.each do |name|
+        klass.alias_method(name, :"__real_#{name}")
+        klass.remove_method(:"__real_#{name}")
+      end
+    end
+  end
+
+  # `Marshal.load` builds an instance of the real class without `initialize`;
+  # the binding rebuilds every value it reads through the core.
 
   def test_a_marshal_forged_value_never_reaches_the_core
     node = tracker(1)

@@ -6,6 +6,7 @@
 
 extern crate std;
 
+use matryona_machines::testing::{XorShift64, refuses, unchanged};
 use std::collections::BTreeSet;
 use std::vec::Vec;
 
@@ -23,19 +24,15 @@ type Event = (usize, u64);
 type Tracker = Causal<SLOTS, HOLD>;
 type Message = Stamp<SLOTS>;
 
-struct Rng(u64);
+/// Draws an index below a `usize` bound.
+trait Pick {
+    fn pick(&mut self, bound: usize) -> usize;
+}
 
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, bound: usize) -> usize {
-        let bound = u64::try_from(bound).unwrap_or(u64::MAX).max(1);
-        usize::try_from(self.next() % bound).unwrap_or(0)
+impl Pick for XorShift64 {
+    fn pick(&mut self, bound: usize) -> usize {
+        let draw = self.below(u64::try_from(bound).unwrap_or(u64::MAX));
+        usize::try_from(draw).unwrap_or(0)
     }
 }
 
@@ -186,7 +183,7 @@ impl Naive {
 }
 
 struct World {
-    rng: Rng,
+    rng: XorShift64,
     trackers: Vec<Tracker>,
     models: Vec<Naive>,
     log: Vec<Message>,
@@ -205,7 +202,7 @@ impl World {
             models.push(Naive::default());
         }
         Self {
-            rng: Rng(seed),
+            rng: XorShift64::new(seed),
             trackers,
             models,
             log: Vec::new(),
@@ -237,20 +234,25 @@ impl World {
             self.conflicts[kind] += 1;
         }
         self.listing(replica, stamp);
-        let before = self.trackers[replica].clone();
         let receipt = self.models[replica].receive(stamp);
-        assert_eq!(self.trackers[replica].receive(stamp), receipt);
+        let tracker = &mut self.trackers[replica];
         // A refusal or an idempotent repeat leaves the whole value alone.
-        if !matches!(receipt, Ok(Receipt::Delivered | Receipt::Held)) {
-            assert_eq!(self.trackers[replica], before);
+        match receipt {
+            Err(refusal) => refuses(tracker, refusal, |t| t.receive(stamp)),
+            Ok(Receipt::Delivered | Receipt::Held) => {
+                assert_eq!(tracker.receive(stamp), receipt);
+            }
+            Ok(Receipt::AlreadyHeld | Receipt::Duplicate) => {
+                assert_eq!(unchanged(tracker, |t| t.receive(stamp)), receipt);
+            }
         }
     }
 
     fn listing(&mut self, replica: usize, stamp: &Message) {
-        let size = 1 + self.rng.below(3);
+        let size = 1 + self.rng.pick(3);
         // A cursor past the membership was never issued: refused once the
         // stamp itself is judged, and nothing is written.
-        let unissued = REPLICAS + self.rng.below(SLOTS);
+        let unissued = REPLICAS + self.rng.pick(SLOTS);
         let mut out = std::vec![Gap::default(); size];
         let expected = self.models[replica]
             .check(stamp)
@@ -296,19 +298,19 @@ impl World {
     }
 
     fn step(&mut self) {
-        let replica = self.rng.below(REPLICAS);
-        match self.rng.below(20) {
+        let replica = self.rng.pick(REPLICAS);
+        match self.rng.pick(20) {
             0..=4 => self.send(replica),
             5..=15 if !self.log.is_empty() => {
-                let stamp = self.log[self.rng.below(self.log.len())];
+                let stamp = self.log[self.rng.pick(self.log.len())];
                 // One arrival in four is a conflicting copy: of a message
                 // parked here when there is one, so that it arrives after
                 // some of the gap has filled, else of any message.
                 let held = &self.models[replica].held;
-                let stamp = match (self.rng.below(4), held.len()) {
+                let stamp = match (self.rng.pick(4), held.len()) {
                     (0, 0) => self.forged(&stamp),
                     (0, _) => {
-                        let parked = held[self.rng.below(held.len())];
+                        let parked = held[self.rng.pick(held.len())];
                         self.forged(&parked)
                     }
                     _ => stamp,
@@ -317,36 +319,35 @@ impl World {
             }
             16..=17 => self.drain(replica),
             18 => {
-                let donor = *self.trackers[self.rng.below(REPLICAS)].clock();
-                let before = self.trackers[replica].clone();
-                let answer = self.trackers[replica].absorb(1, &donor);
+                let donor = *self.trackers[self.rng.pick(REPLICAS)].clock();
+                let tracker = &mut self.trackers[replica];
                 if self.models[replica].absorb(donor.counters()) {
-                    assert_eq!(answer, Ok(Absorbing::Absorbed));
+                    assert_eq!(tracker.absorb(1, &donor), Ok(Absorbing::Absorbed));
                 } else {
-                    assert_eq!(answer, Ok(Absorbing::AlreadyCovered));
-                    assert_eq!(self.trackers[replica], before);
+                    assert_eq!(
+                        unchanged(tracker, |t| t.absorb(1, &donor)),
+                        Ok(Absorbing::AlreadyCovered)
+                    );
                 }
             }
             19 if !self.log.is_empty() => {
-                let event = identity(&self.log[self.rng.below(self.log.len())]);
+                let event = identity(&self.log[self.rng.pick(self.log.len())]);
                 let dropped = self.models[replica].forget(event);
                 let expected = if dropped {
                     Forgetting::Forgotten
                 } else {
                     Forgetting::NotHeld
                 };
-                let before = self.trackers[replica].clone();
-                assert_eq!(
-                    self.trackers[replica].forget(IDS[event.0], event.1),
-                    Ok(expected)
-                );
-                assert_eq!(
-                    self.trackers[replica].forget(99, event.1),
-                    Err(Refusal::UnknownMember)
-                );
-                if !dropped {
-                    assert_eq!(self.trackers[replica], before);
+                let tracker = &mut self.trackers[replica];
+                if dropped {
+                    assert_eq!(tracker.forget(IDS[event.0], event.1), Ok(expected));
+                } else {
+                    assert_eq!(
+                        unchanged(tracker, |t| t.forget(IDS[event.0], event.1)),
+                        Ok(expected)
+                    );
                 }
+                refuses(tracker, Refusal::UnknownMember, |t| t.forget(99, event.1));
             }
             _ => {}
         }
@@ -362,8 +363,8 @@ impl World {
         let mut counters = *stamp.clock.counters();
         // Half the forgeries depend on nobody else; the rest need one
         // message fewer from one other replica.
-        let spared = self.rng.below(SLOTS);
-        let all = self.rng.below(2) == 0;
+        let spared = self.rng.pick(SLOTS);
+        let all = self.rng.pick(2) == 0;
         for (slot, counter) in counters.iter_mut().enumerate() {
             if slot == sender {
                 continue;

@@ -1,6 +1,7 @@
 //! A stamp that conflicts with a parked one is refused on every path.
 
 use super::*;
+use matryona_machines::testing::{refuses, unchanged};
 
 /// The reviewed sequence: `Causal<3, 1>`, members `[1, 2, 3]`, local 3.
 #[test]
@@ -11,9 +12,9 @@ fn a_conflicting_stamp_is_refused_after_the_gap_fills() {
     let parked = from([2, 1, 0]);
     assert_eq!(node.receive(&parked), Ok(Receipt::Held));
     assert_eq!(node.receive(&from([1, 0, 0])), Ok(Receipt::Delivered));
-    let before = node.clone();
-    assert_eq!(node.receive(&from([2, 0, 0])), Err(Refusal::Conflict));
-    assert_eq!(node, before);
+    refuses(&mut node, Refusal::Conflict, |n| {
+        n.receive(&from([2, 0, 0]))
+    });
     assert_eq!(node.held(), 1);
     assert_eq!(node.clock().counters(), &[1, 0, 0]);
     // The parked stamp is still the one that will be delivered.
@@ -30,22 +31,23 @@ fn check_and_missing_refuse_what_receive_refuses() {
     let parked = stamp(A, [2, 1, 0, 0]);
     assert_eq!(c.receive(&parked), Ok(Receipt::Held));
     assert_eq!(c.receive(&stamp(A, [1, 0, 0, 0])), Ok(Receipt::Delivered));
-    let before = c.clone();
     // Deliverable, were it not for the parked stamp.
     let ready = stamp(A, [2, 0, 0, 0]);
     // Missing dependencies of its own, and a hold slot is free.
     let waiting = stamp(A, [2, 0, 1, 0]);
     for other in [ready, waiting] {
         assert_eq!(c.check(&other), Err(Refusal::Conflict));
-        assert_eq!(c.receive(&other), Err(Refusal::Conflict));
+        refuses(&mut c, Refusal::Conflict, |c| c.receive(&other));
         let mut out = [Gap::default(); 4];
         assert_eq!(c.missing(&other, 0, &mut out), Err(Refusal::Conflict));
         assert_eq!(out, [Gap::default(); 4]);
     }
     // The parked stamp itself is not in conflict with anything.
     assert_eq!(c.check(&parked), Ok(Readiness::Missing));
-    assert_eq!(c.receive(&parked), Ok(Receipt::AlreadyHeld));
-    assert_eq!(c, before);
+    assert_eq!(
+        unchanged(&mut c, |c| c.receive(&parked)),
+        Ok(Receipt::AlreadyHeld)
+    );
 }
 
 #[test]
@@ -57,12 +59,15 @@ fn a_conflicting_stamp_is_refused_once_the_counter_is_covered() {
         c.absorb(7, &Vv::from_counters([2, 0, 0, 0])),
         Ok(Absorbing::Absorbed)
     );
-    let before = c.clone();
     // Covered by the delivered clock, yet not the stamp that is parked.
     assert_eq!(c.check(&stamp(A, [2, 0, 0, 0])), Err(Refusal::Conflict));
-    assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Err(Refusal::Conflict));
-    assert_eq!(c.receive(&parked), Ok(Receipt::Duplicate));
-    assert_eq!(c, before);
+    refuses(&mut c, Refusal::Conflict, |c| {
+        c.receive(&stamp(A, [2, 0, 0, 0]))
+    });
+    assert_eq!(
+        unchanged(&mut c, |c| c.receive(&parked)),
+        Ok(Receipt::Duplicate)
+    );
     // The parked stamp leaves by name, as obsolete; then nothing conflicts.
     assert_eq!(c.release(), Some(Release::Obsolete(parked)));
     assert_eq!(c.receive(&stamp(A, [2, 0, 0, 0])), Ok(Receipt::Duplicate));

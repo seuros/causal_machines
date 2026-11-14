@@ -9,14 +9,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.const_set("CAPACITY", HOLD)?;
     hooks(module)?;
     let classes = classes::resolve(ruby, module)?;
-    let vector = ruby.get_inner(classes.vector);
+    let vector = classes.vector.get(ruby);
     vector.define_method("get", method!(vectors::get, 1))?;
     vector.define_method("increment", method!(vectors::increment, 1))?;
     vector.define_method("compare", method!(vectors::compare, 1))?;
     vector.define_method("dominates?", method!(vectors::dominates, 1))?;
     vector.define_method("concurrent?", method!(vectors::concurrent, 1))?;
     vector.define_method("merged", method!(vectors::merged, 1))?;
-    let membership = ruby.get_inner(classes.membership);
+    let membership = classes.membership.get(ruby);
     membership.define_method("slot", method!(vectors::slot, 1))?;
     membership.define_method("replica", method!(vectors::replica, 1))?;
     membership.define_method("len", method!(vectors::len, 0))?;
