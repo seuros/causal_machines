@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.3.0...causal_machines/v0.4.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2: exact readers, symbols! tables, struct-only field reads
+
+### Features
+
+* adopt matryona-machines 0.2: exact readers, symbols! tables, struct-only field reads ([929e75f](https://github.com/seuros/causal_machines/commit/929e75f291a4e87ee25226b0c6e05e99f284339d))
+
 ## [0.3.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.2.0...causal_machines/v0.3.0) (2026-11-14)
 
 
