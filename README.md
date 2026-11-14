@@ -11,7 +11,8 @@ gem 'causal_machines'
 ```
 
 ```ruby
-tracker = CausalMachines::Causal.new([1, 2, 3], 3, 0)   # members, me, generation
+members = CausalMachines::Membership.new([1, 2, 3])
+tracker = CausalMachines::Causal.new(members, 3, 0)   # members, me, generation
 
 def on_message(tracker, stamp, payload, buffer)
   case tracker.receive(stamp)
@@ -31,7 +32,7 @@ end
 stamp = tracker.stamp   # for a message you are about to send
 ```
 
-One tracker per replica. Replica ids, generations and counters are Integers. The tracker keeps stamps. The payloads stay with you.
+One tracker per replica. Replica ids, generations and counters are Integers; clocks are `VersionVector` values and the member list a `Membership`. The tracker keeps stamps. The payloads stay with you.
 
 ## A Message to the Resistance
 
@@ -99,21 +100,23 @@ sequenceDiagram
 ### Stamp
 
 ```ruby
-alice = CausalMachines::Causal.new([1, 2, 3], 1, 0)
-bob   = CausalMachines::Causal.new([1, 2, 3], 2, 0)
-carol = CausalMachines::Causal.new([1, 2, 3], 3, 0)
+members = CausalMachines::Membership.new([1, 2, 3])
+alice = CausalMachines::Causal.new(members, 1, 0)
+bob   = CausalMachines::Causal.new(members, 2, 0)
+carol = CausalMachines::Causal.new(members, 3, 0)
 
 question = alice.stamp
-# => #<data CausalMachines::Stamp generation=0, sender=1, clock=[1, 0, 0]>
+# => #<data CausalMachines::Stamp generation=0, sender=1,
+#      clock=#<data CausalMachines::VersionVector counters=[1, 0, 0, 0, 0, 0, 0, 0]>>
 ```
 
-`stamp` numbers your next message and hands back what to send with it. The clock has one counter per member, in the order you listed them. Your own message counts as delivered to you from that moment. At counter `2**64 - 1` it answers `:exhausted` instead.
+`stamp` numbers your next message and hands back what to send with it. The clock has one counter per membership slot, in the order you listed the members; like the core's `VersionVector<8>`, it always holds `CausalMachines::MEMBERS` counters, the slots past your members at zero. Your own message counts as delivered to you from that moment. At counter `2**64 - 1` it answers `:exhausted` instead.
 
 ### Receive
 
 ```ruby
 bob.receive(question)     # => :delivered
-answer = bob.stamp        # clock [1, 1, 0]: Bob had seen Alice's first
+answer = bob.stamp        # clock counters [1, 1, 0, ...]: Bob had seen Alice's first
 
 carol.receive(answer)     # => :held, the question is not here yet
 carol.receive(answer)     # => :already_held
@@ -135,8 +138,8 @@ After any delivery, call `release` until it returns `nil`. `nil` means nothing i
 ### Missing
 
 ```ruby
-node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
-wanted = CausalMachines::Stamp.new(0, 2, [3, 4, 2])
+node = CausalMachines::Causal.new(CausalMachines::Membership.new([1, 2, 3]), 3, 0)
+wanted = CausalMachines::Stamp.new(0, 2, CausalMachines::VersionVector.new([3, 4, 2]))
 
 page = node.missing(wanted, 0, 2)
 # page.gaps => [Gap(replica=1, from=1, through=3), Gap(replica=2, from=1, through=3)]
@@ -145,48 +148,63 @@ node.missing(wanted, page.next, 2)
 # => Page(gaps=[Gap(replica=3, from=1, through=2)], next=nil)
 ```
 
-`missing(stamp, cursor, limit)` lists what stands between you and that message: per replica, the inclusive run of counters not delivered here. It answers a `Page`. Start at cursor 0, take at most `limit` gaps a call (up to `CausalMachines::MEMBERS`), and pass `page.next` back until it is `nil`. These are the ranges to ask your peers for.
+`missing(stamp, cursor, limit)` lists what stands between you and that message: per replica, the inclusive run of counters not delivered here. It answers a `Page`. Start at cursor 0, take at most `limit` gaps a call (up to `CausalMachines::MEMBERS`), and pass `page.next` back until it is `nil`. A cursor is a member slot; one past the last member was never handed out, so it is refused with `:unknown_member` (after the stamp itself is judged). These are the ranges to ask your peers for.
 
 ### Absorb
 
 ```ruby
-node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
-late = CausalMachines::Stamp.new(0, 1, [2, 0, 0])
+vv = ->(*counters) { CausalMachines::VersionVector.new(counters) }
+node = CausalMachines::Causal.new(CausalMachines::Membership.new([1, 2, 3]), 3, 0)
+late = CausalMachines::Stamp.new(0, 1, vv[2, 0, 0])
 node.receive(late)            # => :held
 
-node.absorb(0, [4, 0, 0])     # => :absorbed, a snapshot already covers 1..4 from replica 1
-node.clock                    # => [4, 0, 0]
+node.absorb(0, vv[4, 0, 0])   # => :absorbed, a snapshot already covers 1..4 from replica 1
+node.absorb(0, vv[3, 0, 0])   # => :already_covered, nothing new, nothing changed
+node.clock                    # => VersionVector counters [4, 0, 0, ...]
 node.release                  # => #<data CausalMachines::Obsolete stamp=late>
 ```
 
-When you install state that already reflects a clock, `absorb` folds that clock into yours by taking the larger counter in every position. Held stamps it covers come out of `release` as `Obsolete(stamp)`: drop their payloads, do not apply them. An honoured `absorb` answers `:absorbed`, also when the clock taught it nothing new.
+When you install state that already reflects a clock, `absorb` folds that clock into yours by taking the larger counter in every position, and answers `:absorbed`. When your clock already covers it, the call is an honoured repeat: `:already_covered`, nothing changed. A clock counting a slot outside the membership is refused with `:malformed`. Held stamps it covers come out of `release` as `Obsolete(stamp)`: drop their payloads, do not apply them.
 
-### Compare and merge
+### Vectors and memberships
 
 ```ruby
-CausalMachines.compare([1, 2], [1, 3])       # => :before
-CausalMachines.compare([2, 1], [1, 2])       # => :concurrent
-CausalMachines.dominates?([1, 3], [1, 2])    # => true
-CausalMachines.concurrent?([2, 1], [1, 2])   # => true
-CausalMachines.merge([5, 0], [2, 9])         # => [5, 9]
+vv = ->(*counters) { CausalMachines::VersionVector.new(counters) }
+vv[1, 2].compare(vv[1, 3])         # => :before
+vv[2, 1].compare(vv[1, 2])         # => :concurrent
+vv[1, 3].dominates?(vv[1, 2])      # => true
+vv[2, 1].concurrent?(vv[1, 2])     # => true
+vv[5, 0].merged(vv[2, 9])          # => VersionVector counters [5, 9, 0, ...]
+vv[5, 0].get(0)                    # => 5
+vv[5, 0].increment(1)              # => VersionVector counters [5, 1, 0, ...]
+vv[2**64 - 1].increment(0)         # => :exhausted
+vv[1].increment(8)                 # => :unknown_member
+CausalMachines::VersionVector.new  # => all zeros, the core's VersionVector::new
+
+members = CausalMachines::Membership.new([10, 20, 30])
+members.slot(20)                   # => 1
+members.replica(2)                 # => 30
+members.len                        # => 3
+members.admits?(vv[0, 0, 0, 1])    # => false, counts a slot outside the members
 ```
 
-Plain version-vector arithmetic on Arrays of the same length. `compare` answers `:equal`, `:before`, `:after` or `:concurrent`.
+`VersionVector` and `Membership` mirror the core types. `VersionVector.new(counters)` is the core's `from_counters`: up to `MEMBERS` counters, the rest zero. A vector is a value, so `increment` answers a new vector (the core's new counter is its `get(slot)`) or a refusal symbol, and `merged` answers the merge. `compare` answers `:equal`, `:before`, `:after` or `:concurrent`. `Membership.new(ids)` is `Membership::from_slice`: distinct ids, at most `MEMBERS`.
 
 ### Capacity
 
 The tracker holds 64 early stamps and up to 8 members. Past that, `receive` refuses a stamp that would have to wait with `:full`:
 
 ```ruby
-node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
-CausalMachines::CAPACITY   # => 64
-CausalMachines::MEMBERS    # => 8
-(2..65).each { |n| node.receive(CausalMachines::Stamp.new(0, 1, [n, 0, 0])) }
-node.receive(CausalMachines::Stamp.new(0, 1, [66, 0, 0]))   # => :full
+node = CausalMachines::Causal.new(CausalMachines::Membership.new([1, 2, 3]), 3, 0)
+from_one = ->(n) { CausalMachines::Stamp.new(0, 1, CausalMachines::VersionVector.new([n])) }
+CausalMachines::CAPACITY        # => 64
+CausalMachines::MEMBERS         # => 8
+(2..65).each { |n| node.receive(from_one[n]) }
+node.receive(from_one[66])      # => :full
 
-node.forget(1, 65)                                          # => :forgotten
-node.forget(1, 65)                                          # => :not_held, nothing changed
-node.receive(CausalMachines::Stamp.new(0, 1, [66, 0, 0]))   # => :held
+node.forget(1, 65)              # => :forgotten
+node.forget(1, 65)              # => :not_held, nothing changed
+node.receive(from_one[66])      # => :held
 ```
 
 A held stamp is never evicted to make room. `forget(sender, counter)` drops one you have decided to stop waiting for; the sender will have to send it again. It answers `:forgotten` when it dropped one and `:not_held` when none was held. Both are honoured: asking to forget a stamp that isn't held is a repeat that changes nothing. A sender outside the membership is refused with `:unknown_member`.
@@ -194,12 +212,13 @@ A held stamp is never evicted to make room. `forget(sender, counter)` drops one 
 ### Conflict
 
 ```ruby
-node = CausalMachines::Causal.new([1, 2, 3], 3, 0)
-waiting = CausalMachines::Stamp.new(0, 1, [2, 1, 0])
+vv = ->(*counters) { CausalMachines::VersionVector.new(counters) }
+node = CausalMachines::Causal.new(CausalMachines::Membership.new([1, 2, 3]), 3, 0)
+waiting = CausalMachines::Stamp.new(0, 1, vv[2, 1, 0])
 node.receive(waiting)                                       # => :held
-node.receive(CausalMachines::Stamp.new(0, 1, [1, 0, 0]))    # => :delivered
+node.receive(CausalMachines::Stamp.new(0, 1, vv[1, 0, 0]))  # => :delivered
 
-other = CausalMachines::Stamp.new(0, 1, [2, 0, 0])   # same sender, same counter, another clock
+other = CausalMachines::Stamp.new(0, 1, vv[2, 0, 0])   # same sender, same counter, another clock
 node.check(other)        # => :conflict
 node.receive(other)      # => :conflict, though nothing it depends on is missing
 node.held                # => 1, the held stamp is still there
@@ -212,11 +231,13 @@ Two stamps with the same sender and counter but different clocks cannot both be 
 ### Generations
 
 ```ruby
-node = CausalMachines::Causal.new([1, 2, 3], 3, 5)
-node.receive(CausalMachines::Stamp.new(4, 1, [1, 0, 0]))   # => :stale_generation
-node.receive(CausalMachines::Stamp.new(6, 1, [1, 0, 0]))   # => :future_generation
-node.receive(CausalMachines::Stamp.new(5, 9, [1, 0, 0]))   # => :unknown_member
-node.receive(CausalMachines::Stamp.new(5, 1, [0, 1, 0]))   # => :malformed
+vv = ->(*counters) { CausalMachines::VersionVector.new(counters) }
+node = CausalMachines::Causal.new(CausalMachines::Membership.new([1, 2, 3]), 3, 5)
+node.receive(CausalMachines::Stamp.new(4, 1, vv[1, 0, 0]))      # => :stale_generation
+node.receive(CausalMachines::Stamp.new(6, 1, vv[1, 0, 0]))      # => :future_generation
+node.receive(CausalMachines::Stamp.new(5, 9, vv[1, 0, 0]))      # => :unknown_member
+node.receive(CausalMachines::Stamp.new(5, 1, vv[0, 1, 0]))      # => :malformed, sender entry 0
+node.receive(CausalMachines::Stamp.new(5, 1, vv[1, 0, 0, 1]))   # => :malformed, outside the members
 ```
 
 ### What each call can answer
@@ -228,19 +249,24 @@ node.receive(CausalMachines::Stamp.new(5, 1, [0, 1, 0]))   # => :malformed
 | `receive` | `:delivered`, `:held`, `:already_held`, `:duplicate` | `:conflict`, `:full`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` |
 | `release` | `Deliver(stamp)`, `Obsolete(stamp)`, `nil` | none |
 | `forget` | `:forgotten`, `:not_held` | `:unknown_member` |
-| `missing` | a `Page` (`gaps`, `next`) | `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` |
-| `absorb` | `:absorbed` | `:stale_generation`, `:future_generation` |
+| `missing` | a `Page` (`gaps`, `next`) | `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member` (sender, or a cursor past the last member), `:malformed` |
+| `absorb` | `:absorbed`, `:already_covered` | `:stale_generation`, `:future_generation`, `:malformed` |
+| `VersionVector#increment` | a new `VersionVector` | `:unknown_member`, `:exhausted` |
 
-Each refusal is the snake_case of one core `Refusal` variant. There is no catch-all symbol. `absorb` cannot answer the core's `Malformed`: a clock of the wrong length raises `RangeError` first.
+Each refusal is the snake_case of one core `Refusal` variant. There is no catch-all symbol. No answer records a clock: the tracker takes no time at all, so the clock rule (an answer records `now` exactly when it depends on it) has nothing to apply to. There are no scoped ids either: replica ids, generations and counters are the caller's, not issued by the tracker.
 
 Membership is fixed for the life of a tracker. Vectors from a different set of replicas mean nothing here, so the member list carries a generation number and stamps from any other generation are refused. Changing the membership means agreeing on a new generation somewhere else and building new trackers.
 
 ## The Rules of the Cutter
 
-- **Ids, generations and counters are Integers** in `0..2**64-1`. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`, and so does a clock whose length is not the member count.
-- **Members are distinct and include you.** Duplicate members or a local id outside the list raise `ArgumentError`.
-- **Refusals don't raise.** `:full`, `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` and `:exhausted` are answers. A refused call changes nothing. `:duplicate`, `:already_held` and `:not_held` are not refusals: the call was honoured and there was nothing left to do.
-- **Mutating calls never answer a boolean.** Every answer is a value or a symbol, so no refusal can pass for `true` in an `if`. Only the predicates `dominates?` and `concurrent?` answer `true` or `false`.
+- **Ids, generations and counters are Integers** in `0..2**64-1`. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`.
+- **Values are valid or do not exist.** `VersionVector`, `Membership`, `Stamp`, `Gap`, `Page`, `Deliver` and `Obsolete` validate when built, by hand or by the tracker, through the core: a wrong type (an Array where a `VersionVector` belongs, say) raises `TypeError`, a value the core would not build raises `RangeError` (more than `MEMBERS` counters or members, duplicate members, a `Gap` from 0 or running backwards, a `Page` no listing answers: a cursor past the last slot, or more gaps than slots before its cursor). Every value class is final: subclassing one raises `TypeError` and `allocate` is gone, so nothing skips that check.
+- **The binding trusts no value it reads.** Sealing stops accidents, not reflection: a named subclass's constant is bound before `inherited` raises, and `Marshal.load` skips `initialize`. So every value passed in must be an instance of exactly the gem's class (a subclass raises `TypeError`), and its fields are rebuilt through the core's constructors (a forged field raises `RangeError`). A forged value never reaches the core.
+- **The binding never loses work.** Every conversion happens before the core is called, and the classes are resolved once, at load. Building an answer runs Ruby code (`new`), so `stamp` and `release` decide on a copy, build the answer, and keep the copy only if the tracker is still unfrozen and unchanged: if building raises, nothing is applied (no counter spent, no stamp taken from the hold table); if it freezes the tracker, `FrozenError`; if it re-enters and changes the tracker, `RuntimeError`, and the outer call is not applied.
+- **Members are distinct and include you.** Duplicate members raise `RangeError` from `Membership.new`; a local id outside the membership, or a restored clock counting a slot outside it, raises `RangeError` from `Causal.new`/`Causal.restore`.
+- **Refusals don't raise.** `:full`, `:conflict`, `:stale_generation`, `:future_generation`, `:unknown_member`, `:malformed` and `:exhausted` are answers. A refused call changes nothing. `:duplicate`, `:already_held`, `:not_held` and `:already_covered` are not refusals: the call was honoured and there was nothing left to do.
+- **No work is lost to an exception.** Every argument is checked and every class looked up before the tracker changes; `release` cannot hand a stamp out of the hold table and then raise.
+- **Mutating calls never answer a boolean.** Every answer is a value or a symbol, so no refusal can pass for `true` in an `if`. Only the predicates `dominates?`, `concurrent?`, `admits?` and `empty?` answer `true` or `false`.
 - **One stamp per sender and counter.** A second stamp with the same sender and counter but a different clock is a `:conflict` while the first is held, even when the second could be delivered on the spot. The held one is never dropped for it.
 - **Frozen means frozen.** `freeze` the tracker and `stamp`, `receive`, `release`, `forget` and `absorb` raise `FrozenError`. `check` and `missing` still answer.
 

@@ -3,19 +3,57 @@ module CausalMachines
   MEMBERS: Integer
   CAPACITY: Integer
 
-  type clock = Array[Integer]
-
   # Why a stamp is not acceptable here at all. A refused call changed nothing.
   # Every refusal is the snake_case of one core `Refusal` variant; there is no
   # catch-all symbol.
   type unfit = :stale_generation | :future_generation | :unknown_member | :malformed
 
+  # Every value validates at construction through the core: TypeError for a
+  # wrong type, RangeError for a value the core would not build. They are
+  # final: subclassing one raises TypeError, and `allocate` is undefined.
+
+  # The core's `VersionVector<MEMBERS>`. `new` with no counters is the core's
+  # `new()`; with counters, its `from_counters` (at most MEMBERS, the rest
+  # zero, so `counters` always holds MEMBERS entries).
+  class VersionVector < Data
+    attr_reader counters: Array[Integer]
+    def self.new: (?Array[Integer] counters) -> VersionVector
+                | (?counters: Array[Integer]) -> VersionVector
+
+    # The counter at `slot`, or nil past the last slot.
+    def get: (Integer slot) -> Integer?
+    # Honoured: a new vector counting one more event at `slot` (self is
+    # unchanged; the new counter is its `get(slot)`). Refusals:
+    # :unknown_member past the last slot, :exhausted at 2**64 - 1.
+    def increment: (Integer slot) -> (VersionVector | :unknown_member | :exhausted)
+    def compare: (VersionVector other) -> (:equal | :before | :after | :concurrent)
+    def dominates?: (VersionVector other) -> bool
+    def concurrent?: (VersionVector other) -> bool
+    # The core's `merged`: the pointwise maximum.
+    def merged: (VersionVector other) -> VersionVector
+  end
+
+  # The core's `Membership<MEMBERS>`: distinct replica ids, as
+  # `Membership::from_slice` accepts them.
+  class Membership < Data
+    attr_reader ids: Array[Integer]
+    def self.new: (Array[Integer] ids) -> Membership
+                | (ids: Array[Integer]) -> Membership
+
+    def slot: (Integer replica) -> Integer?
+    def replica: (Integer slot) -> Integer?
+    def len: () -> Integer
+    def empty?: () -> bool
+    # Whether the vector counts nothing outside these slots.
+    def admits?: (VersionVector clock) -> bool
+  end
+
   class Stamp < Data
     attr_reader generation: Integer
     attr_reader sender: Integer
-    attr_reader clock: clock
-    def self.new: (Integer generation, Integer sender, clock clock) -> Stamp
-                | (generation: Integer, sender: Integer, clock: clock) -> Stamp
+    attr_reader clock: VersionVector
+    def self.new: (Integer generation, Integer sender, VersionVector clock) -> Stamp
+                | (generation: Integer, sender: Integer, clock: VersionVector) -> Stamp
   end
 
   # The core's `Release::Deliver(stamp)`: now delivered, apply its payload.
@@ -32,6 +70,7 @@ module CausalMachines
                 | (stamp: Stamp) -> Obsolete
   end
 
+  # As `Gap::new` accepts it: 1 <= from <= through.
   class Gap < Data
     attr_reader replica: Integer
     attr_reader from: Integer
@@ -40,6 +79,7 @@ module CausalMachines
                 | (replica: Integer, from: Integer, through: Integer) -> Gap
   end
 
+  # At most MEMBERS gaps; `next` is a slot below MEMBERS, or nil.
   class Page < Data
     attr_reader gaps: Array[Gap]
     attr_reader next: Integer?
@@ -47,14 +87,12 @@ module CausalMachines
                 | (gaps: Array[Gap], next: Integer?) -> Page
   end
 
-  def self.compare: (clock left, clock right) -> (:equal | :before | :after | :concurrent)
-  def self.dominates?: (clock left, clock right) -> bool
-  def self.concurrent?: (clock left, clock right) -> bool
-  def self.merge: (clock left, clock right) -> clock
-
   class Causal
-    def self.new: (Array[Integer] members, Integer local, Integer generation) -> Causal
-    def self.restore: (Array[Integer] members, Integer local, Integer generation, clock delivered) -> Causal
+    # RangeError when `local` is not a member (restore: or `delivered` counts
+    # a slot outside the membership).
+    def self.new: (Membership members, Integer local, Integer generation) -> Causal
+    def self.restore: (Membership members, Integer local, Integer generation,
+                       VersionVector delivered) -> Causal
 
     # Honoured: a Stamp. Refusal: :exhausted.
     def stamp: () -> (Stamp | :exhausted)
@@ -78,18 +116,22 @@ module CausalMachines
     # that discards a held stamp without handing it back.
     def forget: (Integer sender, Integer counter) -> (:forgotten | :not_held | :unknown_member)
 
-    # Honoured: a Page. Refusals: the unfit symbols, and :conflict as for
-    # check.
+    # Honoured: a Page. Refusals: the unfit symbols, :conflict as for check,
+    # then :unknown_member when `cursor` is past the last member slot (a
+    # cursor the tracker never handed out). RangeError for a limit above
+    # MEMBERS.
     def missing: (Stamp stamp, Integer cursor, Integer limit) -> (Page | :conflict | unfit)
 
-    # Honoured: :absorbed. Refusals: :stale_generation, :future_generation.
-    # (The core's `Malformed` cannot be reached here: a clock of the wrong
-    # length raises RangeError before the core sees it.)
-    def absorb: (Integer generation, clock clock) -> (:absorbed | :stale_generation | :future_generation)
+    # Honoured: :absorbed when the delivered clock advanced, and the repeat
+    # :already_covered when it already covered `clock` (nothing changed).
+    # Refusals: :stale_generation, :future_generation, and :malformed when
+    # `clock` counts a slot outside the membership.
+    def absorb: (Integer generation, VersionVector clock)
+              -> (:absorbed | :already_covered | :stale_generation | :future_generation | :malformed)
 
-    def clock: () -> clock
+    def clock: () -> VersionVector
     def held: () -> Integer
-    def membership: () -> Array[Integer]
+    def membership: () -> Membership
     def local: () -> Integer
     def generation: () -> Integer
     def capacity: () -> Integer

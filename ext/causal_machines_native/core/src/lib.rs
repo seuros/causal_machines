@@ -4,7 +4,7 @@
 mod tracker;
 mod vector;
 
-pub use tracker::{Causal, Forgetting, Gap, Page, Readiness, Receipt, Release, Stamp};
+pub use tracker::{Absorbing, Causal, Forgetting, Gap, Page, Readiness, Receipt, Release, Stamp};
 pub use vector::{Causality, Membership, VersionVector};
 
 /// Which replica an event came from.

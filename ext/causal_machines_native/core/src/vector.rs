@@ -36,11 +36,11 @@ impl<const N: usize> Membership<N> {
             return None;
         }
         let mut bound = [0; N];
-        for (index, id) in ids.iter().enumerate() {
+        for (index, (slot, id)) in bound.iter_mut().zip(ids).enumerate() {
             if ids.iter().take(index).any(|earlier| earlier == id) {
                 return None;
             }
-            *bound.get_mut(index)? = *id;
+            *slot = *id;
         }
         Some(Self {
             ids: bound,
@@ -63,7 +63,10 @@ impl<const N: usize> Membership<N> {
     /// Member replicas in slot order.
     #[must_use]
     pub fn ids(&self) -> &[ReplicaId] {
-        self.ids.get(..self.len).unwrap_or(&[])
+        self.ids.get(..self.len).unwrap_or_else(|| {
+            debug_assert!(false, "len never exceeds N");
+            &[]
+        })
     }
 
     /// Slot bound to `replica`.
@@ -191,9 +194,7 @@ impl<const N: usize> VersionVector<N> {
         self
     }
 
-    pub(crate) fn set(&mut self, slot: usize, value: u64) {
-        if let Some(counter) = self.counters.get_mut(slot) {
-            *counter = value;
-        }
+    pub(crate) fn counter_mut(&mut self, slot: usize) -> Option<&mut u64> {
+        self.counters.get_mut(slot)
     }
 }

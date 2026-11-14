@@ -13,17 +13,11 @@ const B: ReplicaId = 20;
 const C: ReplicaId = 30;
 
 fn members() -> Membership<4> {
-    let Some(members) = Membership::from_slice(&[A, B, C]) else {
-        panic!("three distinct replicas fit four slots");
-    };
-    members
+    Membership::from_slice(&[A, B, C]).expect("three distinct replicas fit four slots")
 }
 
 fn node(local: ReplicaId) -> Node {
-    let Some(node) = Causal::new(members(), local, 7) else {
-        panic!("local replica is a member");
-    };
-    node
+    Causal::new(members(), local, 7).expect("local replica is a member")
 }
 
 fn stamp(sender: ReplicaId, counters: [u64; 4]) -> Stamp<4> {
@@ -31,32 +25,28 @@ fn stamp(sender: ReplicaId, counters: [u64; 4]) -> Stamp<4> {
 }
 
 fn sent(node: &mut Node) -> Stamp<4> {
-    let Ok(stamp) = node.stamp() else {
-        panic!("counter has room");
-    };
-    stamp
+    node.stamp().expect("counter has room")
+}
+
+fn gap(replica: ReplicaId, from: u64, through: u64) -> Gap {
+    Gap::new(replica, from, through).expect("counters run forward from 1")
 }
 
 fn gaps(node: &Node, stamp: &Stamp<4>, page: usize) -> std::vec::Vec<Gap> {
-    let blank = Gap {
-        replica: 0,
-        from: 0,
-        through: 0,
-    };
     let mut all = std::vec::Vec::new();
     let mut cursor = Some(0);
     while let Some(at) = cursor {
-        let mut out = std::vec![blank; page];
-        let Ok(listed) = node.missing(stamp, at, &mut out) else {
-            panic!("stamp is well formed");
-        };
-        all.extend_from_slice(&out[..listed.written]);
+        let mut out = std::vec![Gap::default(); page];
+        let listed = node
+            .missing(stamp, at, &mut out)
+            .expect("stamp is well formed");
+        all.extend_from_slice(&out[..listed.written()]);
         assert!(
             listed
-                .next
-                .is_none_or(|next| next > at || listed.written == 0)
+                .next()
+                .is_none_or(|next| next > at || listed.written() == 0)
         );
-        cursor = listed.next;
+        cursor = listed.next();
     }
     all
 }
@@ -79,7 +69,7 @@ fn membership_binds_distinct_replicas_to_slots() {
 }
 
 #[test]
-fn vectors_compare_as_a_partial_order() {
+fn vectors_compare_and_merge_as_a_partial_order() {
     let base = Vv::from_counters([1, 2, 0, 0]);
     let later = Vv::from_counters([1, 3, 0, 0]);
     let fork = Vv::from_counters([2, 1, 0, 0]);
@@ -94,10 +84,7 @@ fn vectors_compare_as_a_partial_order() {
     assert_eq!(base.get(1), Some(2));
     assert_eq!(base.get(4), None);
     assert_eq!(base.counters(), &[1, 2, 0, 0]);
-}
-
-#[test]
-fn merge_takes_the_larger_side_and_dominates_both() {
+    // Merging takes the larger side and dominates both.
     let left = Vv::from_counters([5, 0, u64::MAX, 1]);
     let right = Vv::from_counters([2, 9, 3, 1]);
     let joined = left.merged(&right);
@@ -190,25 +177,12 @@ fn a_full_hold_table_refuses_without_mutating() {
     assert_eq!(c.release(), None);
     assert_eq!(c.held(), 1);
 
-    let Some(mut strict) = Causal::<4, 0>::new(members(), C, 7) else {
-        panic!("local replica is a member");
-    };
+    let mut strict = Causal::<4, 0>::new(members(), C, 7).expect("local replica is a member");
     assert_eq!(strict.receive(&stamp(A, [2, 0, 0, 0])), Err(Refusal::Full));
     assert_eq!(
         strict.receive(&stamp(A, [1, 0, 0, 0])),
         Ok(Receipt::Delivered)
     );
-}
-
-#[test]
-fn delivering_directly_drops_the_parked_copy() {
-    let mut c = node(C);
-    let late = stamp(A, [2, 0, 0, 0]);
-    assert_eq!(c.receive(&late), Ok(Receipt::Held));
-    assert_eq!(c.receive(&stamp(A, [1, 0, 0, 0])), Ok(Receipt::Delivered));
-    assert_eq!(c.receive(&late), Ok(Receipt::Delivered));
-    assert_eq!(c.held(), 0);
-    assert_eq!(c.release(), None);
 }
 
 #[test]
@@ -235,10 +209,6 @@ fn stale_future_unknown_and_malformed_stamps_are_refused_untouched() {
     assert_eq!(c, before);
     assert_eq!(std::format!("{}", Refusal::Malformed), "malformed clock");
     assert_eq!(std::format!("{}", Refusal::Full), "hold table full");
-    assert_ne!(
-        std::format!("{}", Refusal::Conflict),
-        std::format!("{}", Refusal::Full)
-    );
 }
 
 #[test]
@@ -249,84 +219,94 @@ fn absorbing_a_clock_makes_covered_parked_stamps_obsolete() {
     let fifth = stamp(A, [5, 1, 0, 0]);
     assert_eq!(c.receive(&third), Ok(Receipt::Held));
     assert_eq!(c.receive(&second), Ok(Receipt::Held));
-    assert_eq!(c.absorb(7, &Vv::from_counters([4, 0, 0, 0])), Ok(()));
+    assert_eq!(
+        c.absorb(7, &Vv::from_counters([4, 0, 0, 0])),
+        Ok(Absorbing::Absorbed)
+    );
     assert_eq!(c.clock().counters(), &[4, 0, 0, 0]);
     assert_eq!(c.release(), Some(Release::Obsolete(second)));
     assert_eq!(c.release(), Some(Release::Obsolete(third)));
     assert_eq!(c.release(), None);
     assert_eq!(c.receive(&fifth), Ok(Receipt::Held));
-    assert_eq!(c.absorb(7, &Vv::from_counters([0, 1, 0, 0])), Ok(()));
+    assert_eq!(
+        c.absorb(7, &Vv::from_counters([0, 1, 0, 0])),
+        Ok(Absorbing::Absorbed)
+    );
     assert_eq!(c.clock().counters(), &[4, 1, 0, 0]);
     assert_eq!(c.release(), Some(Release::Deliver(fifth)));
     assert_eq!(c.clock().counters(), &[5, 1, 0, 0]);
 }
 
 #[test]
-fn an_older_stamp_after_a_newer_one_is_a_duplicate() {
-    let mut c = node(C);
-    assert_eq!(c.absorb(7, &Vv::from_counters([9, 0, 0, 0])), Ok(()));
-    let before = c.clone();
-    assert_eq!(c.receive(&stamp(A, [3, 0, 0, 0])), Ok(Receipt::Duplicate));
-    assert_eq!(c.receive(&stamp(A, [9, 5, 0, 0])), Ok(Receipt::Duplicate));
-    assert_eq!(c, before);
-}
-
-#[test]
 fn missing_dependencies_page_through_a_bounded_buffer() {
     let c = node(C);
     let wanted = stamp(B, [3, 4, 2, 0]);
-    let expected = [
-        Gap {
-            replica: A,
-            from: 1,
-            through: 3,
-        },
-        Gap {
-            replica: B,
-            from: 1,
-            through: 3,
-        },
-        Gap {
-            replica: C,
-            from: 1,
-            through: 2,
-        },
-    ];
+    let expected = [gap(A, 1, 3), gap(B, 1, 3), gap(C, 1, 2)];
     for page in 1..=4 {
         assert_eq!(gaps(&c, &wanted, page), expected);
     }
-    let mut one = [expected[0]; 1];
-    assert_eq!(
-        c.missing(&wanted, 1, &mut one),
-        Ok(Page {
-            written: 1,
-            next: Some(2)
-        })
-    );
-    assert_eq!(one[0], expected[1]);
-    assert_eq!(
-        c.missing(&wanted, 0, &mut []),
-        Ok(Page {
-            written: 0,
-            next: Some(0)
-        })
-    );
-    assert_eq!(
-        c.missing(&wanted, 9, &mut one),
-        Ok(Page {
-            written: 0,
-            next: None
-        })
-    );
+    // A cursor resumes at its slot; the buffer fills from the front and the
+    // rest is left untouched.
+    let mut out = [Gap::default(); 3];
+    let page = c.missing(&wanted, 1, &mut out[..1]);
+    assert_eq!(page.map(|p| (p.written(), p.next())), Ok((1, Some(2))));
+    assert_eq!(out, [expected[1], Gap::default(), Gap::default()]);
+    let page = c.missing(&wanted, 0, &mut []);
+    assert_eq!(page.map(|p| (p.written(), p.next())), Ok((0, Some(0))));
     assert_eq!(gaps(&c, &stamp(A, [1, 0, 0, 0]), 2), []);
+}
+
+#[test]
+fn a_page_is_only_what_missing_could_answer() {
+    assert_eq!(
+        Page::new::<4>(1, Some(2)).map(|p| (p.written(), p.next())),
+        Some((1, Some(2)))
+    );
+    assert!(Page::new::<4>(4, None).is_some());
+    assert!(Page::new::<4>(0, Some(0)).is_some());
+    assert!(Page::new::<4>(3, Some(3)).is_some());
+    assert_eq!(Page::new::<4>(5, None), None); // more gaps than slots
+    assert_eq!(Page::new::<4>(0, Some(4)), None); // a cursor past the slots
+    assert_eq!(Page::new::<4>(3, Some(2)), None); // more gaps than slots before the cursor
+    // Every page `missing` answers is one `Page::new` builds.
+    let c = node(C);
+    let wanted = stamp(B, [3, 4, 2, 0]);
+    for limit in 0..=4 {
+        for cursor in 0..4 {
+            let mut out = [Gap::default(); 4];
+            if let Ok(page) = c.missing(&wanted, cursor, &mut out[..limit]) {
+                assert_eq!(Page::new::<4>(page.written(), page.next()), Some(page));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cursor_the_tracker_never_issued_is_refused() {
+    let c = node(C);
+    let mut out = [Gap::default(); 4];
+    // Past the three member slots, whatever the stamp's readiness.
+    for wanted in [stamp(B, [3, 4, 2, 0]), stamp(A, [1, 0, 0, 0])] {
+        for cursor in [3, 4, usize::MAX] {
+            assert_eq!(
+                c.missing(&wanted, cursor, &mut out),
+                Err(Refusal::UnknownMember)
+            );
+        }
+    }
+    assert_eq!(out, [Gap::default(); 4]);
+    // The stamp is judged first.
+    let stale = Stamp::new(6, A, Vv::from_counters([1, 0, 0, 0]));
+    assert_eq!(
+        c.missing(&stale, 9, &mut out),
+        Err(Refusal::StaleGeneration)
+    );
 }
 
 #[test]
 fn counters_at_the_u64_limit_neither_wrap_nor_reissue() {
     let top = Vv::from_counters([u64::MAX - 1, 0, 0, 0]);
-    let Some(mut a) = Node::restore(members(), A, 7, top) else {
-        panic!("clock stays inside the membership");
-    };
+    let mut a = Node::restore(members(), A, 7, top).expect("clock stays inside the membership");
     let last = sent(&mut a);
     assert_eq!(last.clock.get(0), Some(u64::MAX));
     let before = a.clone();
@@ -335,32 +315,44 @@ fn counters_at_the_u64_limit_neither_wrap_nor_reissue() {
 
     let mut c = node(C);
     assert_eq!(c.receive(&last), Ok(Receipt::Held));
-    assert_eq!(
-        gaps(&c, &last, 4),
-        [Gap {
-            replica: A,
-            from: 1,
-            through: u64::MAX - 1
-        }]
-    );
-    assert_eq!(c.absorb(7, &top), Ok(()));
+    assert_eq!(gaps(&c, &last, 4), [gap(A, 1, u64::MAX - 1)]);
+    assert_eq!(c.absorb(7, &top), Ok(Absorbing::Absorbed));
     assert_eq!(c.release(), Some(Release::Deliver(last)));
     assert_eq!(c.clock().get(0), Some(u64::MAX));
     assert_eq!(c.receive(&last), Ok(Receipt::Duplicate));
 }
 
 #[test]
-fn a_default_buffer_is_filled_from_the_front() {
-    let c = node(C);
-    let mut out = [Gap::default(); 4];
-    assert_eq!(out[0].from, 0);
-    let page = c.missing(&stamp(B, [1, 2, 0, 0]), 0, &mut out);
-    assert_eq!(page.map(|p| (p.written, p.next)), Ok((2, None)));
-    let listed = [(A, 1, 1), (B, 1, 1)].map(|(replica, from, through)| Gap {
-        replica,
-        from,
-        through,
-    });
-    assert_eq!(out[..2], listed);
-    assert_eq!(out[2..], [Gap::default(); 2]);
+fn covered_clocks_and_stamps_are_honoured_repeats() {
+    let mut c = node(C);
+    assert_eq!(
+        c.absorb(7, &Vv::from_counters([4, 1, 0, 0])),
+        Ok(Absorbing::Absorbed)
+    );
+    let before = c.clone();
+    for covered in [[4, 1, 0, 0], [2, 0, 0, 0], [0, 0, 0, 0]] {
+        assert_eq!(
+            c.absorb(7, &Vv::from_counters(covered)),
+            Ok(Absorbing::AlreadyCovered)
+        );
+        assert_eq!(c, before);
+    }
+    // An older stamp after a newer one is a duplicate, whatever it depends on.
+    assert_eq!(c.receive(&stamp(A, [3, 0, 0, 0])), Ok(Receipt::Duplicate));
+    assert_eq!(c.receive(&stamp(A, [4, 5, 0, 0])), Ok(Receipt::Duplicate));
+    assert_eq!(c, before);
+    assert_eq!(
+        c.absorb(7, &Vv::from_counters([3, 2, 0, 0])),
+        Ok(Absorbing::Absorbed)
+    );
+    assert_eq!(c.clock().counters(), &[4, 2, 0, 0]);
+}
+
+#[test]
+fn gaps_are_built_only_as_missing_emits_them() {
+    let run = gap(A, 1, 3);
+    assert_eq!((run.replica(), run.from(), run.through()), (A, 1, 3));
+    assert_eq!(gap(A, u64::MAX, u64::MAX).from(), u64::MAX);
+    assert_eq!(Gap::new(A, 0, 3), None);
+    assert_eq!(Gap::new(A, 4, 3), None);
 }

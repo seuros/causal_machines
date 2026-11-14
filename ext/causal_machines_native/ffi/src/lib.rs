@@ -1,23 +1,25 @@
 //! Thin binding to the causal-delivery tracker and its version vectors.
+mod classes;
 mod init;
+mod values;
 mod vectors;
 
 use std::cell::RefCell;
 
-use causal_machines::{
-    Causal, Forgetting, Gap, Membership, Readiness, Receipt, Refusal, Release, Stamp,
-};
-use magnus::{Error, RArray, RClass, RModule, Ruby, Value, prelude::*, typed_data::Obj};
-use vectors::{Clock, Number, array, clock, numbers};
+use causal_machines::{Absorbing, Causal, Forgetting, Gap, Readiness, Receipt, Refusal, Release};
+use classes::{classes, keep};
+use magnus::{Error, Ruby, Value, prelude::*, typed_data::Obj};
+use values::{gap_value, stamp_value};
+use vectors::{Clock, Number, clock, clock_value, members, members_value};
 
 const MEMBERS: usize = 8;
 const HOLD: usize = 64;
 
 type Core = Causal<MEMBERS, HOLD>;
 
-fn data_class(ruby: &Ruby, name: &str) -> Result<RClass, Error> {
-    let module: RModule = ruby.class_object().const_get("CausalMachines")?;
-    module.const_get(name)
+/// A `RangeError`: right type, a value the core does not accept.
+fn range_error(ruby: &Ruby, message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
+    Error::new(ruby.exception_range_error(), message)
 }
 
 /// The snake case of the core variant.
@@ -32,6 +34,14 @@ fn refusal(ruby: &Ruby, refusal: Refusal) -> Value {
         Refusal::Full => "full",
     };
     ruby.to_symbol(name).as_value()
+}
+
+/// The symbol naming an honoured outcome, or the refusal's symbol.
+fn answer(ruby: &Ruby, outcome: Result<&str, Refusal>) -> Value {
+    match outcome {
+        Ok(name) => ruby.to_symbol(name).as_value(),
+        Err(why) => refusal(ruby, why),
+    }
 }
 
 #[magnus::wrap(class = "CausalMachines::Causal", free_immediately, size)]
@@ -56,72 +66,86 @@ impl Tracker {
 
     fn build(
         ruby: &Ruby,
-        members: Value,
+        membership: Value,
         local: Number,
         generation: Number,
         delivered: Option<Value>,
     ) -> Result<Self, Error> {
-        let (ids, len) = numbers(ruby, members)?;
-        let invalid = |message| Error::new(ruby.exception_arg_error(), message);
-        let membership = Membership::from_slice(ids.get(..len).unwrap_or(&[]))
-            .ok_or_else(|| invalid("members must be distinct"))?;
+        let membership = members(ruby, membership)?;
         let delivered = match delivered {
-            Some(value) => clock(ruby, value, len)?,
+            Some(value) => clock(ruby, value)?,
             None => Clock::new(),
         };
-        let core = Causal::restore(membership, local.0, generation.0, delivered)
-            .ok_or_else(|| invalid("local must be one of the members"))?;
+        let core =
+            Causal::restore(membership, local.0, generation.0, delivered).ok_or_else(|| {
+                range_error(
+                    ruby,
+                    "local must be a member, and delivered must count member slots only",
+                )
+            })?;
         Ok(Self {
             core: RefCell::new(core),
         })
     }
 
+    /// Clone-then-keep: the answer is a `Stamp` built through `new`.
     fn stamp(ruby: &Ruby, this: Obj<Self>) -> Result<Value, Error> {
-        this.check_frozen()?;
-        let outcome = this.core.borrow_mut().stamp();
-        match outcome {
-            Ok(stamp) => this.wrap(ruby, &stamp),
-            Err(why) => Ok(refusal(ruby, why)),
-        }
+        keep(
+            ruby,
+            this,
+            &this.core,
+            Core::stamp,
+            |outcome| match outcome {
+                Ok(stamp) => stamp_value(ruby, &stamp),
+                Err(why) => Ok(refusal(ruby, why)),
+            },
+        )
     }
 
     fn check(ruby: &Ruby, this: Obj<Self>, stamp: Value) -> Result<Value, Error> {
-        let stamp = this.unwrap(ruby, stamp)?;
-        let name = match this.core.borrow().check(&stamp) {
-            Ok(Readiness::Deliverable) => "deliverable",
-            Ok(Readiness::Duplicate) => "duplicate",
-            Ok(Readiness::Missing) => "missing",
-            Err(why) => return Ok(refusal(ruby, why)),
-        };
-        Ok(ruby.to_symbol(name).as_value())
+        let stamp = values::stamp(ruby, stamp)?;
+        let outcome = this.core.borrow().check(&stamp);
+        Ok(answer(
+            ruby,
+            outcome.map(|readiness| match readiness {
+                Readiness::Deliverable => "deliverable",
+                Readiness::Duplicate => "duplicate",
+                Readiness::Missing => "missing",
+            }),
+        ))
     }
 
     fn receive(ruby: &Ruby, this: Obj<Self>, stamp: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let stamp = this.unwrap(ruby, stamp)?;
-        let name = match this.core.borrow_mut().receive(&stamp) {
-            Ok(Receipt::Delivered) => "delivered",
-            Ok(Receipt::Held) => "held",
-            Ok(Receipt::AlreadyHeld) => "already_held",
-            Ok(Receipt::Duplicate) => "duplicate",
-            Err(why) => return Ok(refusal(ruby, why)),
-        };
-        Ok(ruby.to_symbol(name).as_value())
+        let stamp = values::stamp(ruby, stamp)?;
+        let outcome = this.core.borrow_mut().receive(&stamp);
+        Ok(answer(
+            ruby,
+            outcome.map(|receipt| match receipt {
+                Receipt::Delivered => "delivered",
+                Receipt::Held => "held",
+                Receipt::AlreadyHeld => "already_held",
+                Receipt::Duplicate => "duplicate",
+            }),
+        ))
     }
 
     /// A `Deliver` or an `Obsolete` wrapping the stamp, or `nil`.
-    fn release(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
-        this.check_frozen()?;
-        let released = this.core.borrow_mut().release();
-        let Some(released) = released else {
-            return Ok(None);
-        };
-        let (name, stamp) = match released {
-            Release::Deliver(stamp) => ("Deliver", stamp),
-            Release::Obsolete(stamp) => ("Obsolete", stamp),
-        };
-        let stamp = this.wrap(ruby, &stamp)?;
-        data_class(ruby, name)?.funcall("new", (stamp,)).map(Some)
+    /// Clone-then-keep: the stamp leaves the hold table only once its answer
+    /// is built.
+    fn release(ruby: &Ruby, this: Obj<Self>) -> Result<Value, Error> {
+        keep(ruby, this, &this.core, Core::release, |released| {
+            let Some(released) = released else {
+                return Ok(ruby.qnil().as_value());
+            };
+            let classes = classes(ruby)?;
+            let (class, stamp) = match released {
+                Release::Deliver(stamp) => (classes.deliver, stamp),
+                Release::Obsolete(stamp) => (classes.obsolete, stamp),
+            };
+            let stamp = stamp_value(ruby, &stamp)?;
+            ruby.get_inner(class).funcall("new", (stamp,))
+        })
     }
 
     fn forget(
@@ -131,12 +155,14 @@ impl Tracker {
         counter: Number,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let name = match this.core.borrow_mut().forget(sender.0, counter.0) {
-            Ok(Forgetting::Forgotten) => "forgotten",
-            Ok(Forgetting::NotHeld) => "not_held",
-            Err(why) => return Ok(refusal(ruby, why)),
-        };
-        Ok(ruby.to_symbol(name).as_value())
+        let outcome = this.core.borrow_mut().forget(sender.0, counter.0);
+        Ok(answer(
+            ruby,
+            outcome.map(|forgetting| match forgetting {
+                Forgetting::Forgotten => "forgotten",
+                Forgetting::NotHeld => "not_held",
+            }),
+        ))
     }
 
     fn missing(
@@ -146,28 +172,24 @@ impl Tracker {
         cursor: Number,
         limit: Number,
     ) -> Result<Value, Error> {
-        let stamp = this.unwrap(ruby, stamp)?;
-        let limit = usize::try_from(limit.0).unwrap_or(usize::MAX);
+        let stamp = values::stamp(ruby, stamp)?;
+        let limit = limit.index();
         if limit > MEMBERS {
-            return Err(Error::new(
-                ruby.exception_range_error(),
-                format!("limit is at most {MEMBERS}"),
-            ));
+            return Err(range_error(ruby, format!("limit is at most {MEMBERS}")));
         }
         let mut gaps = [Gap::default(); MEMBERS];
-        let cursor = usize::try_from(cursor.0).unwrap_or(usize::MAX);
         let out = gaps.get_mut(..limit).unwrap_or(&mut []);
-        let page = match this.core.borrow().missing(&stamp, cursor, out) {
+        let outcome = this.core.borrow().missing(&stamp, cursor.index(), out);
+        let page = match outcome {
             Ok(page) => page,
             Err(why) => return Ok(refusal(ruby, why)),
         };
-        let class = data_class(ruby, "Gap")?;
-        let listed = ruby.ary_new_capa(page.written);
-        for gap in gaps.iter().take(page.written) {
-            listed
-                .push(class.funcall::<_, _, Value>("new", (gap.replica, gap.from, gap.through))?)?;
+        let listed = ruby.ary_new_capa(page.written());
+        for gap in gaps.iter().take(page.written()) {
+            listed.push(gap_value(ruby, gap)?)?;
         }
-        data_class(ruby, "Page")?.funcall("new", (listed, page.next))
+        let class = ruby.get_inner(classes(ruby)?.page);
+        class.funcall("new", (listed, page.next()))
     }
 
     fn absorb(
@@ -177,28 +199,29 @@ impl Tracker {
         seen: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let seen = clock(ruby, seen, this.len())?;
-        Ok(match this.core.borrow_mut().absorb(generation.0, &seen) {
-            Ok(()) => ruby.to_symbol("absorbed").as_value(),
-            Err(why) => refusal(ruby, why),
-        })
+        let seen = clock(ruby, seen)?;
+        let outcome = this.core.borrow_mut().absorb(generation.0, &seen);
+        Ok(answer(
+            ruby,
+            outcome.map(|absorbing| match absorbing {
+                Absorbing::Absorbed => "absorbed",
+                Absorbing::AlreadyCovered => "already_covered",
+            }),
+        ))
     }
 
-    fn clock(ruby: &Ruby, this: Obj<Self>) -> Result<RArray, Error> {
-        let core = this.core.borrow();
-        array(ruby, core.clock(), core.membership().len())
+    fn clock(ruby: &Ruby, this: Obj<Self>) -> Result<Value, Error> {
+        let delivered = *this.core.borrow().clock();
+        clock_value(ruby, &delivered)
     }
 
     fn held(&self) -> usize {
         self.core.borrow().held()
     }
 
-    fn membership(ruby: &Ruby, this: Obj<Self>) -> Result<RArray, Error> {
-        let out = ruby.ary_new_capa(this.len());
-        for id in this.core.borrow().membership().ids() {
-            out.push(*id)?;
-        }
-        Ok(out)
+    fn membership(ruby: &Ruby, this: Obj<Self>) -> Result<Value, Error> {
+        let membership = *this.core.borrow().membership();
+        members_value(ruby, &membership)
     }
 
     fn local(&self) -> u64 {
@@ -211,28 +234,5 @@ impl Tracker {
 
     const fn capacity() -> usize {
         HOLD
-    }
-
-    fn len(&self) -> usize {
-        self.core.borrow().membership().len()
-    }
-
-    fn wrap(&self, ruby: &Ruby, stamp: &Stamp<MEMBERS>) -> Result<Value, Error> {
-        let counters = array(ruby, &stamp.clock, self.len())?;
-        data_class(ruby, "Stamp")?.funcall("new", (stamp.generation, stamp.sender, counters))
-    }
-
-    fn unwrap(&self, ruby: &Ruby, value: Value) -> Result<Stamp<MEMBERS>, Error> {
-        if !value.is_kind_of(data_class(ruby, "Stamp")?) {
-            return Err(Error::new(
-                ruby.exception_type_error(),
-                "expected a CausalMachines::Stamp",
-            ));
-        }
-        let generation: Number = value.funcall("generation", ())?;
-        let sender: Number = value.funcall("sender", ())?;
-        let counters: Value = value.funcall("clock", ())?;
-        let seen: Clock = clock(ruby, counters, self.len())?;
-        Ok(Stamp::new(generation.0, sender.0, seen))
     }
 }

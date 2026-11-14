@@ -21,9 +21,15 @@ hands back parked stamps one at a time as their dependencies arrive (`None`
 means nothing is ready), `forget` drops a parked stamp and says whether there
 was one (`Forgetting::Forgotten` or `Forgetting::NotHeld`), and
 `missing` lists the undelivered runs per replica into a caller buffer, resumable
-by cursor. It writes the first `Page::written` entries of `out` and leaves the
-rest untouched; build the buffer as `[Gap::default(); K]`. The default is a
-placeholder the core never emits, because counters start at 1.
+by cursor. A cursor is a membership slot: 0 or a `Page::next` the tracker
+handed out. One past the last slot was never issued and is refused with
+`UnknownMember`, after the stamp itself is judged. It writes the first
+`Page::written` entries of `out` and leaves the rest untouched (a refusal
+writes none); build the buffer as `[Gap::default(); K]`. The default is a
+placeholder the core never emits, because counters start at 1. A `Page`'s
+fields are private: `Page::new::<N>(written, next)` rebuilds one and answers
+`None` for a page `missing` could not have answered (more gaps than slots, a
+cursor past the slots, or more gaps than slots before the cursor).
 
 `Refusal` is the only refusal type, and no public enum is `#[non_exhaustive]`:
 a new variant is a breaking change every caller matches on. A refused call was not honoured and leaves
@@ -46,6 +52,11 @@ how a caller resolves a conflict in favour of the refused stamp, or delivered
 by `receive` when the identical stamp arrives again and is now ready. `absorb`
 never touches the hold table.
 
+`absorb` answers `Absorbing::Absorbed` when the clock advanced the delivered
+clock and `Absorbing::AlreadyCovered` when the delivered clock already
+dominated it: an idempotent repeat, provable from the delivered clock alone,
+that changes nothing.
+
 | Operation | Honoured | Refusals |
 | --- | --- | --- |
 | `stamp() -> Result<Stamp, Refusal>` | the stamp | `Exhausted` |
@@ -53,13 +64,27 @@ never touches the hold table.
 | `receive(&stamp) -> Result<Receipt, Refusal>` | `Delivered`, `Held`, `AlreadyHeld`, `Duplicate` | as `check`, plus `Full` |
 | `release() -> Option<Release>` | a release, or `None` when nothing is ready | none |
 | `forget(sender, counter) -> Result<Forgetting, Refusal>` | `Forgotten`, `NotHeld` | `UnknownMember` |
-| `missing(&stamp, cursor, out) -> Result<Page, Refusal>` | the page | as `check` |
-| `absorb(generation, &clock) -> Result<(), Refusal>` | `()` | `StaleGeneration`, `FutureGeneration`, `Malformed` |
+| `missing(&stamp, cursor, out) -> Result<Page, Refusal>` | the page | as `check`, then `UnknownMember` for a cursor past the last membership slot |
+| `absorb(generation, &clock) -> Result<Absorbing, Refusal>` | `Absorbed`, `AlreadyCovered` | `StaleGeneration`, `FutureGeneration`, `Malformed` |
+| `VersionVector::increment(slot) -> Result<u64, Refusal>` | the new counter | `UnknownMember`, `Exhausted` |
 
-`Receipt::AlreadyHeld`, `Receipt::Duplicate` and `Forgetting::NotHeld` are
-idempotent repeats: what the caller asked for already holds, so the call is
-honoured and changes nothing. In Ruby the honoured outcomes are the symbols
-`:forgotten` and `:not_held` for `forget`, and `:absorbed` for `absorb`.
+`Receipt::AlreadyHeld`, `Receipt::Duplicate`, `Forgetting::NotHeld` and
+`Absorbing::AlreadyCovered` are idempotent repeats: what the caller asked for
+already holds, so the call is honoured and changes nothing. In Ruby every
+honoured outcome is the snake-case symbol of its variant.
+
+No operation takes or records a clock: the core has no notion of time, so no
+answer depends on `now`. It issues no ids either: replicas, generations and
+counters are the caller's.
+
+The values validate where they are built. `Membership::from_slice` refuses
+duplicates and more than `N` ids, `Gap::new` refuses a run starting at 0 or
+ending before it starts (its fields are private, read through `replica()`,
+`from()` and `through()`, so no `Gap` skips that check), and `Stamp::new` and `VersionVector::from_counters`
+accept every input; the receiving tracker judges a stamp. In release builds no
+operation panics: an arm the invariants rule out (a membership slot past `N`)
+is a `debug_assert!` that answers the most conservative result with nothing
+changed.
 
 This is a policy core. It stores stamps, never payloads. It has no transport, no
 retransmission, no persistence, no clock and no membership change protocol. The
@@ -83,8 +108,8 @@ let answer = bob.stamp().expect("counter has room");
 assert_eq!(carol.receive(&answer), Ok(Receipt::Held));
 let mut gaps = [Gap::default(); 3];
 let page = carol.missing(&answer, 0, &mut gaps).expect("well formed");
-assert_eq!((page.written, page.next), (1, None));
-assert_eq!(gaps[0], Gap { replica: 1, from: 1, through: 1 });
+assert_eq!((page.written(), page.next()), (1, None));
+assert_eq!(Some(gaps[0]), Gap::new(1, 1, 1));
 
 assert_eq!(carol.receive(&question), Ok(Receipt::Delivered));
 assert_eq!(carol.release(), Some(Release::Deliver(answer)));

@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use std::vec::Vec;
 
 use crate::{
-    Causal, Forgetting, Gap, Membership, Readiness, Receipt, Refusal, Release, ReplicaId, Stamp,
-    VersionVector,
+    Absorbing, Causal, Forgetting, Gap, Membership, Readiness, Receipt, Refusal, Release,
+    ReplicaId, Stamp, VersionVector,
 };
 
 const SLOTS: usize = 5;
@@ -40,10 +40,9 @@ impl Rng {
 }
 
 fn slot_of(replica: ReplicaId) -> usize {
-    let Some(slot) = IDS.iter().position(|id| *id == replica) else {
-        panic!("model only sends from members");
-    };
-    slot
+    IDS.iter()
+        .position(|id| *id == replica)
+        .expect("model only sends from members")
 }
 
 fn identity(stamp: &Message) -> Event {
@@ -144,12 +143,15 @@ impl Naive {
         Some(Release::Deliver(stamp))
     }
 
-    fn absorb(&mut self, counters: &[u64; SLOTS]) {
+    /// Whether the clock taught anything new.
+    fn absorb(&mut self, counters: &[u64; SLOTS]) -> bool {
+        let before = self.delivered.len();
         for (slot, count) in counters.iter().enumerate() {
             for counter in 1..=*count {
                 self.delivered.insert((slot, counter));
             }
         }
+        self.delivered.len() != before
     }
 
     fn forget(&mut self, event: Event) -> bool {
@@ -169,11 +171,7 @@ impl Naive {
             let from = counters.clone().map(|event| event.1).min();
             let through = counters.map(|event| event.1).max();
             if let (Some(from), Some(through)) = (from, through) {
-                gaps.push(Gap {
-                    replica: *replica,
-                    from,
-                    through,
-                });
+                gaps.extend(Gap::new(*replica, from, through));
             }
         }
         gaps
@@ -199,16 +197,11 @@ struct World {
 
 impl World {
     fn new(seed: u64) -> Self {
-        let Some(members) = Membership::from_slice(&IDS) else {
-            panic!("four distinct replicas fit five slots");
-        };
+        let members = Membership::from_slice(&IDS).expect("four distinct replicas fit five slots");
         let mut trackers = Vec::new();
         let mut models = Vec::new();
         for id in IDS {
-            let Some(tracker) = Tracker::new(members, id, 1) else {
-                panic!("every id is a member");
-            };
-            trackers.push(tracker);
+            trackers.push(Tracker::new(members, id, 1).expect("every id is a member"));
             models.push(Naive::default());
         }
         Self {
@@ -221,9 +214,9 @@ impl World {
     }
 
     fn send(&mut self, replica: usize) {
-        let Ok(stamp) = self.trackers[replica].stamp() else {
-            panic!("small counters never exhaust");
-        };
+        let stamp = self.trackers[replica]
+            .stamp()
+            .expect("small counters never exhaust");
         assert_eq!(
             self.models[replica].check(&stamp),
             Ok(Readiness::Deliverable)
@@ -254,16 +247,21 @@ impl World {
     }
 
     fn listing(&mut self, replica: usize, stamp: &Message) {
-        let blank = Gap {
-            replica: 0,
-            from: 0,
-            through: 0,
-        };
         let size = 1 + self.rng.below(3);
+        // A cursor past the membership was never issued: refused once the
+        // stamp itself is judged, and nothing is written.
+        let unissued = REPLICAS + self.rng.below(SLOTS);
+        let mut out = std::vec![Gap::default(); size];
+        let expected = self.models[replica]
+            .check(stamp)
+            .and(Err(Refusal::UnknownMember));
+        let page = self.trackers[replica].missing(stamp, unissued, &mut out);
+        assert_eq!(page, expected);
+        assert!(out.iter().all(|gap| *gap == Gap::default()));
         let mut listed = Vec::new();
         let mut cursor = Some(0);
         while let Some(at) = cursor {
-            let mut out = std::vec![blank; size];
+            let mut out = std::vec![Gap::default(); size];
             let page = self.trackers[replica].missing(stamp, at, &mut out);
             let Ok(page) = page else {
                 assert_eq!(
@@ -272,8 +270,8 @@ impl World {
                 );
                 return;
             };
-            listed.extend_from_slice(&out[..page.written]);
-            cursor = page.next;
+            listed.extend_from_slice(&out[..page.written()]);
+            cursor = page.next();
         }
         assert_eq!(listed, self.models[replica].gaps(stamp));
     }
@@ -320,8 +318,14 @@ impl World {
             16..=17 => self.drain(replica),
             18 => {
                 let donor = *self.trackers[self.rng.below(REPLICAS)].clock();
-                assert_eq!(self.trackers[replica].absorb(1, &donor), Ok(()));
-                self.models[replica].absorb(donor.counters());
+                let before = self.trackers[replica].clone();
+                let answer = self.trackers[replica].absorb(1, &donor);
+                if self.models[replica].absorb(donor.counters()) {
+                    assert_eq!(answer, Ok(Absorbing::Absorbed));
+                } else {
+                    assert_eq!(answer, Ok(Absorbing::AlreadyCovered));
+                    assert_eq!(self.trackers[replica], before);
+                }
             }
             19 if !self.log.is_empty() => {
                 let event = identity(&self.log[self.rng.below(self.log.len())]);

@@ -5,12 +5,8 @@ use super::*;
 /// The reviewed sequence: `Causal<3, 1>`, members `[1, 2, 3]`, local 3.
 #[test]
 fn a_conflicting_stamp_is_refused_after_the_gap_fills() {
-    let Some(members) = Membership::<3>::from_slice(&[1, 2, 3]) else {
-        panic!("three distinct replicas fit three slots");
-    };
-    let Some(mut node) = Causal::<3, 1>::new(members, 3, 1) else {
-        panic!("local replica is a member");
-    };
+    let members = Membership::<3>::from_slice(&[1, 2, 3]).expect("three distinct ids fit");
+    let mut node = Causal::<3, 1>::new(members, 3, 1).expect("local replica is a member");
     let from = |counters| Stamp::new(1, 1, VersionVector::<3>::from_counters(counters));
     let parked = from([2, 1, 0]);
     assert_eq!(node.receive(&parked), Ok(Receipt::Held));
@@ -23,7 +19,7 @@ fn a_conflicting_stamp_is_refused_after_the_gap_fills() {
     // The parked stamp is still the one that will be delivered.
     assert_eq!(
         node.absorb(1, &VersionVector::from_counters([0, 1, 0])),
-        Ok(())
+        Ok(Absorbing::Absorbed)
     );
     assert_eq!(node.release(), Some(Release::Deliver(parked)));
 }
@@ -57,7 +53,10 @@ fn a_conflicting_stamp_is_refused_once_the_counter_is_covered() {
     let mut c = node(C);
     let parked = stamp(A, [2, 1, 0, 0]);
     assert_eq!(c.receive(&parked), Ok(Receipt::Held));
-    assert_eq!(c.absorb(7, &Vv::from_counters([2, 0, 0, 0])), Ok(()));
+    assert_eq!(
+        c.absorb(7, &Vv::from_counters([2, 0, 0, 0])),
+        Ok(Absorbing::Absorbed)
+    );
     let before = c.clone();
     // Covered by the delivered clock, yet not the stamp that is parked.
     assert_eq!(c.check(&stamp(A, [2, 0, 0, 0])), Err(Refusal::Conflict));

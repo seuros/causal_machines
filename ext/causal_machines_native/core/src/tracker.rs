@@ -63,6 +63,16 @@ pub enum Forgetting {
     NotHeld,
 }
 
+/// What an honoured [`Causal::absorb`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absorbing {
+    /// The clock taught something new: the delivered clock advanced.
+    Absorbed,
+    /// An idempotent repeat: the delivered clock already covers the clock.
+    /// Nothing changed.
+    AlreadyCovered,
+}
+
 /// A parked stamp leaving the hold table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release<const N: usize> {
@@ -75,24 +85,89 @@ pub enum Release<const N: usize> {
 /// A run of undelivered messages from one replica, inclusive at both ends.
 ///
 /// `Gap::default()` is a placeholder for pre-filling an output buffer: its
-/// `from` is 0, and counters start at 1, so [`Causal::missing`] never emits it.
+/// `from` is 0, and counters start at 1, so [`Causal::missing`] never emits it
+/// and [`Gap::new`] never builds it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gap {
+    replica: ReplicaId,
+    from: u64,
+    through: u64,
+}
+
+impl Gap {
+    /// A gap from its parts, as [`Causal::missing`] emits it.
+    ///
+    /// Returns `None` when `from` is 0 (counters start at 1) or `from` is
+    /// past `through`.
+    #[must_use]
+    pub const fn new(replica: ReplicaId, from: u64, through: u64) -> Option<Self> {
+        if from == 0 || from > through {
+            return None;
+        }
+        Some(Self {
+            replica,
+            from,
+            through,
+        })
+    }
+
     /// Replica whose messages are missing.
-    pub replica: ReplicaId,
+    #[must_use]
+    pub const fn replica(&self) -> ReplicaId {
+        self.replica
+    }
+
     /// First missing counter.
-    pub from: u64,
+    #[must_use]
+    pub const fn from(&self) -> u64 {
+        self.from
+    }
+
     /// Last missing counter.
-    pub through: u64,
+    #[must_use]
+    pub const fn through(&self) -> u64 {
+        self.through
+    }
 }
 
 /// One bounded page of a missing-dependency listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
+    written: usize,
+    next: Option<usize>,
+}
+
+impl Page {
+    /// A page as [`Causal::missing`] answers it for `N` membership slots.
+    ///
+    /// Each gap comes from its own slot, and a page that stops early stops at
+    /// the slot it could not write, after the slots it did. So `None` when
+    /// `written` exceeds `N`, `next` is not a slot below `N`, or `written`
+    /// exceeds `next`.
+    #[must_use]
+    pub const fn new<const N: usize>(written: usize, next: Option<usize>) -> Option<Self> {
+        let fits = match next {
+            Some(slot) => slot < N && written <= slot,
+            None => written <= N,
+        };
+        if fits {
+            Some(Self { written, next })
+        } else {
+            None
+        }
+    }
+
     /// Gaps written to the front of the output buffer.
-    pub written: usize,
+    #[must_use]
+    pub const fn written(&self) -> usize {
+        self.written
+    }
+
     /// Cursor to pass to the next call, or `None` when the listing is done.
-    pub next: Option<usize>,
+    #[must_use]
+    pub const fn next(&self) -> Option<usize> {
+        self.next
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +175,13 @@ struct Parked<const N: usize> {
     slot: usize,
     counter: u64,
     stamp: Stamp<N>,
+}
+
+impl<const N: usize> Parked<N> {
+    /// Whether this is the sender's message numbered `counter` from `slot`.
+    const fn numbers(&self, slot: usize, counter: u64) -> bool {
+        self.slot == slot && self.counter == counter
+    }
 }
 
 /// One replica's causal-delivery state: `N` membership slots, `P` hold slots.
@@ -238,11 +320,11 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         match readiness {
             Readiness::Duplicate => Ok(Receipt::Duplicate),
             Readiness::Deliverable => {
-                // `classify` refused any other stamp: this is the same one.
-                if let Some(index) = self.find(slot, counter) {
-                    self.vacate(index);
+                if !advance(&mut self.delivered, slot, counter) {
+                    return Err(Refusal::Malformed);
                 }
-                self.delivered.set(slot, counter);
+                // `classify` refused any other stamp: a parked one is this one.
+                self.remove(slot, counter);
                 Ok(Receipt::Delivered)
             }
             Readiness::Missing => self.park(slot, counter, stamp),
@@ -257,14 +339,20 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// advancing the delivered clock. Call until `None`, which is a drain's
     /// "nothing is ready" and not a refusal; it changes nothing.
     pub fn release(&mut self) -> Option<Release<N>> {
-        if let Some(index) = self.pick(Self::covered) {
-            return self
-                .vacate(index)
-                .map(|parked| Release::Obsolete(parked.stamp));
+        let (delivered, len) = (&mut self.delivered, self.members.len());
+        if let Some((entry, parked)) = pick(&mut self.parked, |parked| {
+            parked.counter <= seen(delivered, parked.slot)
+        }) {
+            *entry = None;
+            return Some(Release::Obsolete(parked.stamp));
         }
-        let index = self.pick(Self::ready)?;
-        let parked = self.vacate(index)?;
-        self.delivered.set(parked.slot, parked.counter);
+        let (entry, parked) = pick(&mut self.parked, |parked| {
+            !blocked(delivered, len, parked.slot, &parked.stamp.clock)
+        })?;
+        if !advance(delivered, parked.slot, parked.counter) {
+            return None;
+        }
+        *entry = None;
         Some(Release::Deliver(parked.stamp))
     }
 
@@ -282,10 +370,11 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// [`Refusal::UnknownMember`] when `sender` is not in the membership.
     pub fn forget(&mut self, sender: ReplicaId, counter: u64) -> Result<Forgetting, Refusal> {
         let slot = self.members.slot(sender).ok_or(Refusal::UnknownMember)?;
-        let dropped = self
-            .find(slot, counter)
-            .and_then(|index| self.vacate(index));
-        Ok(dropped.map_or(Forgetting::NotHeld, |_| Forgetting::Forgotten))
+        Ok(if self.remove(slot, counter) {
+            Forgetting::Forgotten
+        } else {
+            Forgetting::NotHeld
+        })
     }
 
     /// Lists what must be delivered before `stamp`, one bounded page a call.
@@ -294,12 +383,18 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// `None`. Gaps are measured against the delivered clock; a parked stamp
     /// does not close one. A deliverable or duplicate stamp lists nothing.
     ///
+    /// A cursor is a membership slot: the listing resumes at that slot. Every
+    /// `next` the tracker hands out is one, and 0 always is, so a cursor past
+    /// the last slot is one it never issued and is refused.
+    ///
     /// The first [`Page::written`] entries of `out` are written; the rest are
     /// left untouched. Build the buffer as `[Gap::default(); K]`.
     ///
     /// # Errors
     ///
-    /// As [`Causal::check`], [`Refusal::Conflict`] included.
+    /// As [`Causal::check`], [`Refusal::Conflict`] included, then
+    /// [`Refusal::UnknownMember`] when `cursor` is not a membership slot. A
+    /// refusal writes nothing to `out`.
     pub fn missing(
         &self,
         stamp: &Stamp<N>,
@@ -307,6 +402,9 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         out: &mut [Gap],
     ) -> Result<Page, Refusal> {
         let (sender, _, readiness) = self.classify(stamp)?;
+        if cursor >= self.members.len() {
+            return Err(Refusal::UnknownMember);
+        }
         let mut page = Page {
             written: 0,
             next: None,
@@ -315,7 +413,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
             return Ok(page);
         }
         for (slot, replica) in self.members.ids().iter().enumerate().skip(cursor) {
-            let Some((from, through)) = self.gap(slot, sender, &stamp.clock) else {
+            let Some((from, through)) = gap(&self.delivered, slot, sender, &stamp.clock) else {
                 continue;
             };
             let Some(entry) = out.get_mut(page.written) else {
@@ -338,17 +436,27 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// `clock`, those messages count as delivered. Parked stamps this covers
     /// leave through [`Causal::release`] as obsolete.
     ///
+    /// [`Absorbing::AlreadyCovered`] is an idempotent repeat: the delivered
+    /// clock already dominates `clock`, so nothing changes.
+    ///
     /// # Errors
     ///
     /// Generation refusals, or [`Refusal::Malformed`] when `clock` counts a
     /// slot outside the membership.
-    pub fn absorb(&mut self, generation: u64, clock: &VersionVector<N>) -> Result<(), Refusal> {
+    pub fn absorb(
+        &mut self,
+        generation: u64,
+        clock: &VersionVector<N>,
+    ) -> Result<Absorbing, Refusal> {
         self.admit(generation)?;
         if !self.members.admits(clock) {
             return Err(Refusal::Malformed);
         }
+        if self.delivered.dominates(clock) {
+            return Ok(Absorbing::AlreadyCovered);
+        }
         self.delivered.merge(clock);
-        Ok(())
+        Ok(Absorbing::Absorbed)
     }
 
     const fn admit(&self, generation: u64) -> Result<(), Refusal> {
@@ -370,16 +478,19 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         if !self.members.admits(&stamp.clock) {
             return Err(Refusal::Malformed);
         }
-        let counter = stamp.clock.get(slot).ok_or(Refusal::Malformed)?;
+        let Some(counter) = stamp.clock.get(slot) else {
+            debug_assert!(false, "a sender's slot is a membership slot");
+            return Err(Refusal::Malformed);
+        };
         if counter == 0 {
             return Err(Refusal::Malformed);
         }
         if self.conflicts(slot, counter, stamp) {
             return Err(Refusal::Conflict);
         }
-        let readiness = if counter <= self.seen(slot) {
+        let readiness = if counter <= seen(&self.delivered, slot) {
             Readiness::Duplicate
-        } else if self.blocked(slot, &stamp.clock) {
+        } else if blocked(&self.delivered, self.members.len(), slot, &stamp.clock) {
             Readiness::Missing
         } else {
             Readiness::Deliverable
@@ -387,64 +498,39 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         Ok((slot, counter, readiness))
     }
 
-    fn seen(&self, slot: usize) -> u64 {
-        self.delivered.get(slot).unwrap_or(0)
-    }
-
-    /// The undelivered run at `slot` that a message from `sender` stamped
-    /// `clock` waits for.
-    fn gap(&self, slot: usize, sender: usize, clock: &VersionVector<N>) -> Option<(u64, u64)> {
-        let stamped = clock.get(slot)?;
-        let needed = if slot == sender {
-            stamped.checked_sub(1)?
-        } else {
-            stamped
-        };
-        let seen = self.seen(slot);
-        (seen < needed).then(|| (seen.saturating_add(1), needed))
-    }
-
-    fn blocked(&self, sender: usize, clock: &VersionVector<N>) -> bool {
-        (0..self.members.len()).any(|slot| self.gap(slot, sender, clock).is_some())
-    }
-
-    fn covered(&self, parked: &Parked<N>) -> bool {
-        parked.counter <= self.seen(parked.slot)
-    }
-
-    fn ready(&self, parked: &Parked<N>) -> bool {
-        !self.blocked(parked.slot, &parked.stamp.clock)
-    }
-
     /// Whether a parked stamp numbers the same message as `stamp` but is not
     /// `stamp`. At most one stamp is parked per sender and counter.
     fn conflicts(&self, slot: usize, counter: u64, stamp: &Stamp<N>) -> bool {
-        self.parked.iter().flatten().any(|parked| {
-            parked.slot == slot && parked.counter == counter && parked.stamp != *stamp
-        })
-    }
-
-    fn find(&self, slot: usize, counter: u64) -> Option<usize> {
-        self.parked.iter().position(|entry| {
-            entry.is_some_and(|parked| parked.slot == slot && parked.counter == counter)
-        })
-    }
-
-    /// Hold-table index of the matching stamp with the lowest slot, then the
-    /// lowest counter.
-    fn pick(&self, matches: impl Fn(&Self, &Parked<N>) -> bool) -> Option<usize> {
         self.parked
             .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| entry.as_ref().map(|parked| (index, parked)))
-            .filter(|(_, parked)| matches(self, parked))
-            .min_by_key(|(_, parked)| (parked.slot, parked.counter))
-            .map(|(index, _)| index)
+            .flatten()
+            .any(|parked| parked.numbers(slot, counter) && parked.stamp != *stamp)
+    }
+
+    fn holds(&self, slot: usize, counter: u64) -> bool {
+        self.parked
+            .iter()
+            .flatten()
+            .any(|parked| parked.numbers(slot, counter))
+    }
+
+    /// Drops the parked stamp numbered `counter` from `slot`, if there is
+    /// one, and says whether there was.
+    fn remove(&mut self, slot: usize, counter: u64) -> bool {
+        let Some(entry) = self
+            .parked
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|parked| parked.numbers(slot, counter)))
+        else {
+            return false;
+        };
+        *entry = None;
+        true
     }
 
     fn park(&mut self, slot: usize, counter: u64, stamp: &Stamp<N>) -> Result<Receipt, Refusal> {
         // `classify` refused any other stamp: a parked one is this one.
-        if self.find(slot, counter).is_some() {
+        if self.holds(slot, counter) {
             return Ok(Receipt::AlreadyHeld);
         }
         let free = self
@@ -459,8 +545,67 @@ impl<const N: usize, const P: usize> Causal<N, P> {
         });
         Ok(Receipt::Held)
     }
+}
 
-    fn vacate(&mut self, index: usize) -> Option<Parked<N>> {
-        self.parked.get_mut(index).and_then(Option::take)
-    }
+/// What `delivered` has seen from `slot`.
+fn seen<const N: usize>(delivered: &VersionVector<N>, slot: usize) -> u64 {
+    delivered.get(slot).unwrap_or_else(|| {
+        debug_assert!(false, "only membership slots are read");
+        0
+    })
+}
+
+/// Records `counter` as the last message `delivered` has seen from `slot`.
+///
+/// Callers pass a sender's membership slot, so this always succeeds; `false`
+/// is the arm that invariant rules out, with nothing changed.
+fn advance<const N: usize>(delivered: &mut VersionVector<N>, slot: usize, counter: u64) -> bool {
+    let Some(seen) = delivered.counter_mut(slot) else {
+        debug_assert!(false, "a sender's slot is a membership slot");
+        return false;
+    };
+    *seen = counter;
+    true
+}
+
+/// The undelivered run at `slot` that a message from `sender` stamped `clock`
+/// waits for, against `delivered`.
+fn gap<const N: usize>(
+    delivered: &VersionVector<N>,
+    slot: usize,
+    sender: usize,
+    clock: &VersionVector<N>,
+) -> Option<(u64, u64)> {
+    let stamped = clock.get(slot)?;
+    let needed = if slot == sender {
+        stamped.checked_sub(1)?
+    } else {
+        stamped
+    };
+    let seen = seen(delivered, slot);
+    (seen < needed).then(|| (seen.saturating_add(1), needed))
+}
+
+fn blocked<const N: usize>(
+    delivered: &VersionVector<N>,
+    len: usize,
+    sender: usize,
+    clock: &VersionVector<N>,
+) -> bool {
+    (0..len).any(|slot| gap(delivered, slot, sender, clock).is_some())
+}
+
+/// The hold-table entry of the matching stamp with the lowest slot, then the
+/// lowest counter, with a copy of the stamp.
+fn pick<const N: usize>(
+    parked: &mut [Option<Parked<N>>],
+    matches: impl Fn(&Parked<N>) -> bool,
+) -> Option<(&mut Option<Parked<N>>, Parked<N>)> {
+    parked
+        .iter_mut()
+        .filter_map(|entry| {
+            let held = (*entry)?;
+            matches(&held).then_some((entry, held))
+        })
+        .min_by_key(|(_, held)| (held.slot, held.counter))
 }

@@ -1,16 +1,27 @@
 //! Private native entry point.
-use crate::{HOLD, MEMBERS, Tracker, vectors};
-use magnus::{Error, Ruby, function, method, prelude::*};
+use crate::{HOLD, MEMBERS, Tracker, classes, values, vectors};
+use magnus::{Error, RModule, Ruby, function, method, prelude::*};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("CausalMachines")?;
     module.const_set("MEMBERS", MEMBERS)?;
     module.const_set("CAPACITY", HOLD)?;
-    module.define_singleton_method("compare", function!(vectors::compare, 2))?;
-    module.define_singleton_method("dominates?", function!(vectors::dominates, 2))?;
-    module.define_singleton_method("concurrent?", function!(vectors::concurrent, 2))?;
-    module.define_singleton_method("merge", function!(vectors::merge, 2))?;
+    hooks(module)?;
+    let classes = classes::resolve(ruby, module)?;
+    let vector = ruby.get_inner(classes.vector);
+    vector.define_method("get", method!(vectors::get, 1))?;
+    vector.define_method("increment", method!(vectors::increment, 1))?;
+    vector.define_method("compare", method!(vectors::compare, 1))?;
+    vector.define_method("dominates?", method!(vectors::dominates, 1))?;
+    vector.define_method("concurrent?", method!(vectors::concurrent, 1))?;
+    vector.define_method("merged", method!(vectors::merged, 1))?;
+    let membership = ruby.get_inner(classes.membership);
+    membership.define_method("slot", method!(vectors::slot, 1))?;
+    membership.define_method("replica", method!(vectors::replica, 1))?;
+    membership.define_method("len", method!(vectors::len, 0))?;
+    membership.define_method("empty?", method!(vectors::is_empty, 0))?;
+    membership.define_method("admits?", method!(vectors::admits, 1))?;
     let class = module.define_class("Causal", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Tracker::new, 3))?;
@@ -28,5 +39,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("local", method!(Tracker::local, 0))?;
     class.define_method("generation", method!(Tracker::generation, 0))?;
     class.define_method("capacity", function!(Tracker::capacity, 0))?;
+    Ok(())
+}
+
+/// The private validating hooks the `Data` values call from `initialize`.
+fn hooks(module: RModule) -> Result<(), Error> {
+    module.define_singleton_method("__counters", function!(vectors::checked_counters, 1))?;
+    module.define_singleton_method("__ids", function!(vectors::checked_ids, 1))?;
+    module.define_singleton_method("__stamp", function!(values::checked_stamp, 3))?;
+    module.define_singleton_method("__release", function!(values::checked_release, 1))?;
+    module.define_singleton_method("__gap", function!(values::checked_gap_fields, 3))?;
+    module.define_singleton_method("__page", function!(values::checked_page, 2))?;
     Ok(())
 }
