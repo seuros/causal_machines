@@ -67,7 +67,14 @@ class CausalTest < Minitest::Test
     assert_equal Page.new([Gap.new(3, 1, 2)], nil), node.missing(wanted, first.next, 2)
     assert_equal Page.new([], 0), node.missing(wanted, 0, 0)
     assert_equal Page.new([], nil), node.missing(stamp(1, [1, 0, 0]), 0, 8)
-    assert_raises(RangeError) { node.missing(wanted, 0, 9) }
+    # One range for the limit, past MEMBERS and past usize alike, read before
+    # the stamp is.
+    [9, -1, 2**64].each do |limit|
+      error = assert_raises(RangeError) { node.missing(wanted, 0, limit) }
+      assert_equal 'limit must be in 0..=8', error.message
+      error = assert_raises(RangeError) { node.missing(Object.new, 0, limit) }
+      assert_equal 'limit must be in 0..=8', error.message
+    end
     # A cursor past the last member slot was never handed out: refused,
     # whatever the stamp's readiness, once the stamp itself is judged.
     [3, 7, 2**64 - 1].each do |cursor|

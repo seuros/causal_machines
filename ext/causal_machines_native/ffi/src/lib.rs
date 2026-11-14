@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use causal_machines::{Absorbing, Causal, Forgetting, Gap, Readiness, Receipt, Refusal, Release};
 use classes::classes;
 use magnus::{Error, Ruby, Value, prelude::*, typed_data::Obj};
-use matryona_machines::ruby::{Symbols, integer, keep};
+use matryona_machines::ruby::{Symbols, integer, integer_in, keep};
 use values::{gap_value, stamp_value};
 use vectors::{Clock, clock, clock_value, members, members_value};
 
@@ -188,12 +188,9 @@ impl Tracker {
         cursor: Value,
         limit: Value,
     ) -> Result<Value, Error> {
-        let (cursor, limit): (usize, usize) =
-            (integer(cursor, "cursor")?, integer(limit, "limit")?);
+        let cursor: usize = integer(cursor, "cursor")?;
+        let limit = integer_in(limit, "limit", 0..=MEMBERS)?;
         let stamp = values::stamp(ruby, stamp)?;
-        if limit > MEMBERS {
-            return Err(range_error(ruby, format!("limit is at most {MEMBERS}")));
-        }
         let mut gaps = [Gap::default(); MEMBERS];
         let out = gaps.get_mut(..limit).unwrap_or(&mut []);
         let outcome = this.core.borrow().missing(&stamp, cursor, out);
