@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/seuros/causal_machines/compare/causal_machines/v0.5.0...causal_machines/v0.5.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.4 ([c0738ff](https://github.com/seuros/causal_machines/commit/c0738ffd0a2e4f98d60d7ad36d0b5fa4506107b5))
+
 ## [0.5.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.4.0...causal_machines/v0.5.0) (2026-11-14)
 
 
