@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/causal_machines/compare/causal-machines-v0.6.0...causal-machines-v0.7.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* make Stamp fields private and rename Page::written to gaps
+
+### Features
+
+* make Stamp fields private and rename Page::written to gaps ([72e7251](https://github.com/seuros/causal_machines/commit/72e72511df535122c04c82b59293b7fbb7634063))
+
 ## [0.6.0](https://github.com/seuros/causal_machines/compare/causal-machines-v0.5.0...causal-machines-v0.6.0) (2026-11-14)
 
 
