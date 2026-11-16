@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/causal_machines/compare/causal_machines/v0.6.0...causal_machines/v0.6.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([f94dbaf](https://github.com/seuros/causal_machines/commit/f94dbaf0302fe295327dcaf133830caf33551cc2))
+
 ## [0.6.0](https://github.com/seuros/causal_machines/compare/causal_machines/v0.5.1...causal_machines/v0.6.0) (2026-11-16)
 
 
