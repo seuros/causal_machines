@@ -279,7 +279,7 @@ Two messages with timestamps 5 and 6 might be a question and its answer, or two 
 
 ## What's Yours
 
-The tracker lives in your process and forgets everything when the process does. Persist `clock` and rebuild with `Causal.restore` if a restart must not reuse counters or redeliver. Payloads, the buffer that holds them while their stamp waits, the network, retransmission of the gaps `missing` reports, and any agreement on who the members are: all yours. This is an initial release with an unstable API. It is the rulebook for causal order, not a broadcast runtime.
+The tracker lives in your process and forgets everything when the process does. Persist `clock` and rebuild with `Causal.restore` if a restart must not reuse counters or redeliver. Payloads, the buffer that holds them while their stamp waits, the network, retransmission of the gaps `missing` reports, and any agreement on who the members are: all yours. Pre-1.0: breaking changes land in minor versions. It is the rulebook for causal order, not a broadcast runtime.
 
 ## License
 

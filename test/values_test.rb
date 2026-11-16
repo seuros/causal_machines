@@ -67,20 +67,11 @@ class ValuesTest < Minitest::Test
   end
 
   def redefined(readers)
-    readers.each do |klass, names|
-      names.each do |name|
-        klass.alias_method(:"__real_#{name}", name)
-        klass.define_method(name) { raise "#{name} reader called" }
-      end
-    end
+    originals = readers.flat_map { |klass, names| names.map { [klass, it, klass.instance_method(it)] } }
+    originals.each { |klass, name, _| replace_method(klass, name, proc { raise "#{name} reader called" }) }
     yield
   ensure
-    readers.each do |klass, names|
-      names.each do |name|
-        klass.alias_method(name, :"__real_#{name}")
-        klass.remove_method(:"__real_#{name}")
-      end
-    end
+    originals&.each { |klass, name, method| replace_method(klass, name, (method if method.owner == klass)) }
   end
 
   # `Marshal.load` builds an instance of the real class without `initialize`;
@@ -169,20 +160,39 @@ class ValuesTest < Minitest::Test
 
   # Runs the block with `klass.new` calling `hook` first, once; the original
   # `new` is restored afterwards.
-  def replacing(klass, hook)
+  def replacing(klass, hook, &)
     original = klass.method(:new)
     armed = true
-    klass.define_singleton_method(:new) do |*args, **kw|
+    body = proc do |*args, **kw|
       if armed
         armed = false
         hook.call(*args)
       end
       original.call(*args, **kw)
     end
+    redefining(klass.singleton_class, new: body, &)
+  end
+
+  # Runs the block with each method of `klass` named in `bodies` replaced by
+  # its body, then restores the originals.
+  def redefining(klass, **bodies)
+    originals = bodies.to_h { |name, _| [name, klass.instance_method(name)] }
+    bodies.each { |name, body| replace_method(klass, name, body) }
     yield
   ensure
-    klass.singleton_class.send(:remove_method, :new)
-    klass.define_singleton_method(:new, original)
+    originals&.each { |name, method| replace_method(klass, name, (method if method.owner == klass)) }
+  end
+
+  # Defines `name` on `klass` as `body` (removes it when `body` is nil),
+  # removing the method `klass` itself holds first. Ruby warns about the
+  # redefinition, deliberate here, so warnings are off for the swap alone.
+  def replace_method(klass, name, body)
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    klass.remove_method(name) if klass.method_defined?(name, false) || klass.private_method_defined?(name, false)
+    klass.define_method(name, body) if body
+  ensure
+    $VERBOSE = verbose
   end
 
   # An instance of `klass` holding `fields`, loaded by Marshal from a look-alike

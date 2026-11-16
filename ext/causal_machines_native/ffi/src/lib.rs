@@ -198,8 +198,8 @@ impl Tracker {
             Ok(page) => page,
             Err(why) => return Ok(refusal(ruby, why)),
         };
-        let listed = ruby.ary_new_capa(page.written());
-        for gap in gaps.iter().take(page.written()) {
+        let listed = ruby.ary_new_capa(page.gaps());
+        for gap in gaps.iter().take(page.gaps()) {
             listed.push(gap_value(ruby, gap)?)?;
         }
         let class = classes(ruby)?.page.get(ruby);

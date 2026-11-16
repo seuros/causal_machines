@@ -41,11 +41,11 @@ fn gaps(node: &Node, stamp: &Stamp<4>, page: usize) -> std::vec::Vec<Gap> {
         let listed = node
             .missing(stamp, at, &mut out)
             .expect("stamp is well formed");
-        all.extend_from_slice(&out[..listed.written()]);
+        all.extend_from_slice(&out[..listed.gaps()]);
         assert!(
             listed
                 .next()
-                .is_none_or(|next| next > at || listed.written() == 0)
+                .is_none_or(|next| next > at || listed.gaps() == 0)
         );
         cursor = listed.next();
     }
@@ -115,7 +115,7 @@ fn messages_deliver_in_causal_order_whatever_order_they_arrive() {
     let first = sent(&mut a);
     assert_eq!(b.receive(&first), Ok(Receipt::Delivered));
     let reply = sent(&mut b);
-    assert_eq!(reply.clock.counters(), &[1, 1, 0, 0]);
+    assert_eq!(reply.clock().counters(), &[1, 1, 0, 0]);
 
     assert_eq!(c.check(&reply), Ok(Readiness::Missing));
     assert_eq!(c.receive(&reply), Ok(Receipt::Held));
@@ -255,17 +255,17 @@ fn missing_dependencies_page_through_a_bounded_buffer() {
     // rest is left untouched.
     let mut out = [Gap::default(); 3];
     let page = c.missing(&wanted, 1, &mut out[..1]);
-    assert_eq!(page.map(|p| (p.written(), p.next())), Ok((1, Some(2))));
+    assert_eq!(page.map(|p| (p.gaps(), p.next())), Ok((1, Some(2))));
     assert_eq!(out, [expected[1], Gap::default(), Gap::default()]);
     let page = c.missing(&wanted, 0, &mut []);
-    assert_eq!(page.map(|p| (p.written(), p.next())), Ok((0, Some(0))));
+    assert_eq!(page.map(|p| (p.gaps(), p.next())), Ok((0, Some(0))));
     assert_eq!(gaps(&c, &stamp(A, [1, 0, 0, 0]), 2), []);
 }
 
 #[test]
 fn a_page_is_only_what_missing_could_answer() {
     assert_eq!(
-        Page::new::<4>(1, Some(2)).map(|p| (p.written(), p.next())),
+        Page::new::<4>(1, Some(2)).map(|p| (p.gaps(), p.next())),
         Some((1, Some(2)))
     );
     assert!(Page::new::<4>(4, None).is_some());
@@ -281,7 +281,7 @@ fn a_page_is_only_what_missing_could_answer() {
         for cursor in 0..4 {
             let mut out = [Gap::default(); 4];
             if let Ok(page) = c.missing(&wanted, cursor, &mut out[..limit]) {
-                assert_eq!(Page::new::<4>(page.written(), page.next()), Some(page));
+                assert_eq!(Page::new::<4>(page.gaps(), page.next()), Some(page));
             }
         }
     }
@@ -314,7 +314,7 @@ fn counters_at_the_u64_limit_neither_wrap_nor_reissue() {
     let top = Vv::from_counters([u64::MAX - 1, 0, 0, 0]);
     let mut a = Node::restore(members(), A, 7, top).expect("clock stays inside the membership");
     let last = sent(&mut a);
-    assert_eq!(last.clock.get(0), Some(u64::MAX));
+    assert_eq!(last.clock().get(0), Some(u64::MAX));
     refuses(&mut a, Refusal::Exhausted, Node::stamp);
 
     let mut c = node(C);

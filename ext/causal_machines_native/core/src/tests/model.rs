@@ -43,15 +43,15 @@ fn slot_of(replica: ReplicaId) -> usize {
 }
 
 fn identity(stamp: &Message) -> Event {
-    let slot = slot_of(stamp.sender);
-    (slot, stamp.clock.counters()[slot])
+    let slot = slot_of(stamp.sender());
+    (slot, stamp.clock().counters()[slot])
 }
 
 /// Every event the message needs delivered first.
 fn dependencies(stamp: &Message) -> Vec<Event> {
     let own = identity(stamp);
     let mut needed = Vec::new();
-    for (slot, count) in stamp.clock.counters().iter().enumerate() {
+    for (slot, count) in stamp.clock().counters().iter().enumerate() {
         for counter in 1..=*count {
             if (slot, counter) != own {
                 needed.push((slot, counter));
@@ -272,7 +272,7 @@ impl World {
                 );
                 return;
             };
-            listed.extend_from_slice(&out[..page.written()]);
+            listed.extend_from_slice(&out[..page.gaps()]);
             cursor = page.next();
         }
         assert_eq!(listed, self.models[replica].gaps(stamp));
@@ -359,8 +359,8 @@ impl World {
     /// arrive deliverable while the genuine message is still parked. `stamp`
     /// itself when there is nothing to take away.
     fn forged(&mut self, stamp: &Message) -> Message {
-        let sender = slot_of(stamp.sender);
-        let mut counters = *stamp.clock.counters();
+        let sender = slot_of(stamp.sender());
+        let mut counters = *stamp.clock().counters();
         // Half the forgeries depend on nobody else; the rest need one
         // message fewer from one other replica.
         let spared = self.rng.pick(SLOTS);
@@ -376,8 +376,8 @@ impl World {
             }
         }
         Message::new(
-            stamp.generation,
-            stamp.sender,
+            stamp.generation(),
+            stamp.sender(),
             VersionVector::from_counters(counters),
         )
     }

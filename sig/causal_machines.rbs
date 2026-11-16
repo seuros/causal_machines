@@ -136,4 +136,13 @@ module CausalMachines
     def generation: () -> Integer
     def capacity: () -> Integer
   end
+
+  # Private native hooks each Data value's `initialize` validates through.
+  # The Arrays answered are frozen copies.
+  private def self.__counters: (Array[Integer] counters) -> Array[Integer]
+  private def self.__ids: (Array[Integer] ids) -> Array[Integer]
+  private def self.__stamp: (Integer generation, Integer sender, VersionVector clock) -> [Integer, Integer, VersionVector]
+  private def self.__release: (Stamp stamp) -> Stamp
+  private def self.__gap: (Integer replica, Integer from, Integer through) -> [Integer, Integer, Integer]
+  private def self.__page: (Array[Gap] gaps, Integer? next) -> [Array[Gap], Integer?]
 end

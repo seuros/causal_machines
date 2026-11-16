@@ -10,9 +10,9 @@ use crate::{MEMBERS, range_error};
 
 /// A `CausalMachines::Stamp` of `stamp`, built through `new`.
 pub fn stamp_value(ruby: &Ruby, stamp: &Stamp<MEMBERS>) -> Result<Value, Error> {
-    let clock = clock_value(ruby, &stamp.clock)?;
+    let clock = clock_value(ruby, stamp.clock())?;
     let class = classes(ruby)?.stamp.get(ruby);
-    class.funcall("new", (stamp.generation, stamp.sender, clock))
+    class.funcall("new", (stamp.generation(), stamp.sender(), clock))
 }
 
 /// A `CausalMachines::Gap` of `gap`, built through `new`.

@@ -6,8 +6,9 @@ Gem::Specification.new do |spec|
   spec.version = CausalMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial fixed-membership version vectors and causal-delivery readiness with a native Rust core'
-  spec.description = 'Local unstable causal-order policy core; holds no payloads and owns no transport or execution.'
+  spec.summary = 'Fixed-membership version vectors and causal-delivery readiness with a native Rust core'
+  spec.description = 'Causal-order policy core: parks early stamps until their dependencies land; ' \
+                     'holds no payloads and owns no transport or execution.'
   spec.homepage = 'https://github.com/seuros/causal_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

@@ -9,12 +9,9 @@ use crate::{Membership, Refusal, ReplicaId, VersionVector};
 /// delivered before sending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp<const N: usize> {
-    /// Membership generation the stamp was issued under.
-    pub generation: u64,
-    /// Replica that sent the message.
-    pub sender: ReplicaId,
-    /// Sender's version vector, including this message.
-    pub clock: VersionVector<N>,
+    generation: u64,
+    sender: ReplicaId,
+    clock: VersionVector<N>,
 }
 
 impl<const N: usize> Stamp<N> {
@@ -26,6 +23,24 @@ impl<const N: usize> Stamp<N> {
             sender,
             clock,
         }
+    }
+
+    /// Membership generation the stamp was issued under.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Replica that sent the message.
+    #[must_use]
+    pub const fn sender(&self) -> ReplicaId {
+        self.sender
+    }
+
+    /// Sender's version vector, including this message.
+    #[must_use]
+    pub const fn clock(&self) -> &VersionVector<N> {
+        &self.clock
     }
 }
 
@@ -133,7 +148,7 @@ impl Gap {
 /// One bounded page of a missing-dependency listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
-    written: usize,
+    gaps: usize,
     next: Option<usize>,
 }
 
@@ -142,16 +157,16 @@ impl Page {
     ///
     /// Each gap comes from its own slot, and a page that stops early stops at
     /// the slot it could not write, after the slots it did. So `None` when
-    /// `written` exceeds `N`, `next` is not a slot below `N`, or `written`
+    /// `gaps` exceeds `N`, `next` is not a slot below `N`, or `gaps`
     /// exceeds `next`.
     #[must_use]
-    pub const fn new<const N: usize>(written: usize, next: Option<usize>) -> Option<Self> {
+    pub const fn new<const N: usize>(gaps: usize, next: Option<usize>) -> Option<Self> {
         let fits = match next {
-            Some(slot) => slot < N && written <= slot,
-            None => written <= N,
+            Some(slot) => slot < N && gaps <= slot,
+            None => gaps <= N,
         };
         if fits {
-            Some(Self { written, next })
+            Some(Self { gaps, next })
         } else {
             None
         }
@@ -159,8 +174,8 @@ impl Page {
 
     /// Gaps written to the front of the output buffer.
     #[must_use]
-    pub const fn written(&self) -> usize {
-        self.written
+    pub const fn gaps(&self) -> usize {
+        self.gaps
     }
 
     /// Cursor to pass to the next call, or `None` when the listing is done.
@@ -387,7 +402,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
     /// `next` the tracker hands out is one, and 0 always is, so a cursor past
     /// the last slot is one it never issued and is refused.
     ///
-    /// The first [`Page::written`] entries of `out` are written; the rest are
+    /// The first [`Page::gaps`] entries of `out` are written; the rest are
     /// left untouched. Build the buffer as `[Gap::default(); K]`.
     ///
     /// # Errors
@@ -406,7 +421,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
             return Err(Refusal::UnknownMember);
         }
         let mut page = Page {
-            written: 0,
+            gaps: 0,
             next: None,
         };
         if readiness != Readiness::Missing {
@@ -416,7 +431,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
             let Some((from, through)) = gap(&self.delivered, slot, sender, &stamp.clock) else {
                 continue;
             };
-            let Some(entry) = out.get_mut(page.written) else {
+            let Some(entry) = out.get_mut(page.gaps) else {
                 page.next = Some(slot);
                 break;
             };
@@ -425,7 +440,7 @@ impl<const N: usize, const P: usize> Causal<N, P> {
                 from,
                 through,
             };
-            page.written += 1;
+            page.gaps += 1;
         }
         Ok(page)
     }

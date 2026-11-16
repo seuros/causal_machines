@@ -24,10 +24,10 @@ was one (`Forgetting::Forgotten` or `Forgetting::NotHeld`), and
 by cursor. A cursor is a membership slot: 0 or a `Page::next` the tracker
 handed out. One past the last slot was never issued and is refused with
 `UnknownMember`, after the stamp itself is judged. It writes the first
-`Page::written` entries of `out` and leaves the rest untouched (a refusal
+`Page::gaps` entries of `out` and leaves the rest untouched (a refusal
 writes none); build the buffer as `[Gap::default(); K]`. The default is a
 placeholder the core never emits, because counters start at 1. A `Page`'s
-fields are private: `Page::new::<N>(written, next)` rebuilds one and answers
+fields are private: `Page::new::<N>(gaps, next)` rebuilds one and answers
 `None` for a page `missing` could not have answered (more gaps than slots, a
 cursor past the slots, or more gaps than slots before the cursor).
 
@@ -80,11 +80,12 @@ counters are the caller's.
 The values validate where they are built. `Membership::from_slice` refuses
 duplicates and more than `N` ids, `Gap::new` refuses a run starting at 0 or
 ending before it starts (its fields are private, read through `replica()`,
-`from()` and `through()`, so no `Gap` skips that check), and `Stamp::new` and `VersionVector::from_counters`
-accept every input; the receiving tracker judges a stamp. In release builds no
-operation panics: an arm the invariants rule out (a membership slot past `N`)
-is a `debug_assert!` that answers the most conservative result with nothing
-changed.
+`from()` and `through()`, so no `Gap` skips that check), and `Stamp::new` and
+`VersionVector::from_counters` accept every input; the receiving tracker judges
+a stamp. A `Stamp` reads its parts through `generation()`, `sender()` and
+`clock()`. In release builds no operation panics: an arm the invariants rule
+out (a membership slot past `N`) is a `debug_assert!` that answers the most
+conservative result with nothing changed.
 
 This is a policy core. It stores stamps, never payloads. It has no transport, no
 retransmission, no persistence, no clock and no membership change protocol. The
@@ -108,7 +109,7 @@ let answer = bob.stamp().expect("counter has room");
 assert_eq!(carol.receive(&answer), Ok(Receipt::Held));
 let mut gaps = [Gap::default(); 3];
 let page = carol.missing(&answer, 0, &mut gaps).expect("well formed");
-assert_eq!((page.written(), page.next()), (1, None));
+assert_eq!((page.gaps(), page.next()), (1, None));
 assert_eq!(Some(gaps[0]), Gap::new(1, 1, 1));
 
 assert_eq!(carol.receive(&question), Ok(Receipt::Delivered));
