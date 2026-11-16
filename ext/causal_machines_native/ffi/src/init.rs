@@ -1,6 +1,7 @@
 //! Private native entry point.
 use crate::{HOLD, MEMBERS, Tracker, classes, values, vectors};
 use magnus::{Error, RModule, Ruby, function, method, prelude::*};
+use matryona_machines::ruby::Class;
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -39,7 +40,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("local", method!(Tracker::local, 0))?;
     class.define_method("generation", method!(Tracker::generation, 0))?;
     class.define_method("capacity", function!(Tracker::capacity, 0))?;
-    Ok(())
+    // Fix magnus's class for Causal now: building one later runs no Ruby.
+    Class::pin_wrapped::<Tracker>(ruby, class).map(drop)
 }
 
 /// The private validating hooks the `Data` values call from `initialize`.
